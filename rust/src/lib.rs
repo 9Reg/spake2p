@@ -258,6 +258,21 @@ public_bytes!(
     SCALAR_LEN
 );
 
+// `L` is `w1·P`: public on the wire in the protocol's sense, but anyone holding it can test
+// password guesses offline, so a copy kept in memory is wiped when dropped (a `Clone` is wiped
+// too). `PartialEq` stays; the rest of the API is unchanged.
+impl Zeroize for L {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+impl Drop for L {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+impl ZeroizeOnDrop for L {}
+
 impl L {
     /// Parses a stored `L`: exactly 65 bytes, uncompressed SEC1, canonical coordinates, on the
     /// curve, not the identity. Call it when loading a record, so a corrupted one is found before

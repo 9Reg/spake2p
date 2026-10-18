@@ -752,3 +752,14 @@ fn pbkdf_input_layout() {
     want.extend_from_slice(&0u64.to_le_bytes());
     assert_eq!(*got, want);
 }
+
+#[test]
+fn l_is_wiped_by_zeroize_and_still_clones() {
+    let (_, _, l) = creds(7);
+    let copy = l.clone();
+    assert_eq!(copy, l);
+    let mut wiped = l;
+    zeroize::Zeroize::zeroize(&mut wiped);
+    assert_eq!(wiped.as_bytes(), &[0u8; 65]);
+    assert_ne!(copy, wiped);
+}
