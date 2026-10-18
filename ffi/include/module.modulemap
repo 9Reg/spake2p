@@ -1,0 +1,4 @@
+module CSpake2p {
+    header "spake2p.h"
+    export *
+}

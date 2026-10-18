@@ -1,0 +1,22 @@
+[package]
+name = "spake2p-ffi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/9Reg/spake2p"
+description = "C ABI over the spake2p crate (RFC 9383 SPAKE2+), for the Swift package"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+spake2p = { path = "../rust" }
+
+# Panics must unwind so that catch_unwind can turn them into a status code at the boundary.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = "symbols"

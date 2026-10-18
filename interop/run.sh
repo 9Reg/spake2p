@@ -6,6 +6,10 @@
 # Runs headless in the dev containers. The two drivers live in different containers, so the host
 # shell joins them: two FIFOs on the host carry each side's stdout to the other's stdin.
 #
+# On macOS with swift/CSpake2p.xcframework built (scripts/build-xcframework.sh), the Swift driver
+# joins in too: swift<->go pairings. It runs on the host (headless, no window), the Go driver stays
+# in its container.
+#
 # Usage: interop/run.sh [runs-per-case]   (default 3)
 set -eu
 
@@ -24,6 +28,16 @@ echo "building go driver"
 docker run --rm -v "$ROOT:/w" -w /w/go -v spake2p-gomod:/go/pkg/mod -e CGO_ENABLED=0 "$GO_IMAGE" \
 	sh -c 'go build -o /w/dist/interop/bin/go-driver ./cmd/interop-driver'
 
+SWIFT=0
+if [ "$(uname -s)" = Darwin ] && [ -d "$ROOT/swift/CSpake2p.xcframework" ]; then
+	echo "building swift driver"
+	DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}
+	export DEVELOPER_DIR
+	(cd "$ROOT/swift" && swift build -q -c release --product spake2p-interop-driver)
+	cp "$(cd "$ROOT/swift" && swift build -c release --product spake2p-interop-driver --show-bin-path)/spake2p-interop-driver" "$OUT/bin/swift-driver"
+	SWIFT=1
+fi
+
 hex() { od -An -tx1 -N"$1" /dev/urandom | tr -d ' \n'; }
 
 config() { # file context idProver idVerifier pbkdf_output
@@ -34,6 +48,7 @@ driver() { # lang role config -> runs the driver with stdin/stdout as given by t
 	case $1 in
 	rust) img=$RUST_IMAGE ;;
 	go) img=$GO_IMAGE ;;
+	swift) "$OUT/bin/swift-driver" "$2" "$3"; return ;; # on the host: $3 is already a host path
 	esac
 	docker run --rm -i -v "$OUT:/o" "$img" "/o/bin/$1-driver" "$2" "/o/$(basename "$3")"
 }
@@ -77,7 +92,9 @@ run_case() { # proverLang verifierLang mismatch n
 	fi
 }
 
-for pair in "rust go" "go rust" "rust rust" "go go"; do
+set -- "rust go" "go rust" "rust rust" "go go"
+if [ $SWIFT = 1 ]; then set -- "$@" "swift go" "go swift"; fi
+for pair in "$@"; do
 	set -- $pair
 	i=1
 	while [ $i -le "$RUNS" ]; do

@@ -13,7 +13,8 @@ password itself.
 |---|---|---|
 | [`rust/`](rust/) | crate `spake2p` | RustCrypto `p256`, `sha2`, `hmac`, `hkdf` |
 | [`go/`](go/) | module `github.com/9Reg/spake2p/go` | `filippo.io/nistec`, Go standard library |
-| [`swift/`](swift/) | package `Spake2p` | the Rust crate, through a C ABI |
+| [`ffi/`](ffi/) | crate `spake2p-ffi` (C ABI, `include/spake2p.h`) | the Rust crate, as a static library |
+| [`swift/`](swift/) | package `Spake2p` | the Rust crate, through `ffi/` |
 
 The Rust and Go implementations are independent of each other. Both reproduce the RFC's test
 vectors byte for byte ([`vectors/`](vectors/)), and [`interop/run.sh`](interop/run.sh) runs each as
