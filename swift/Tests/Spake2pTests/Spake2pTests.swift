@@ -130,10 +130,12 @@ private func exchange(
         #expect(throws: Spake2pError.invalidLength) { _ = try respond(shareP + Data([0])) }
         #expect(throws: Spake2pError.notOnCurve) { _ = try respond(flip(shareP, 64)) }
         #expect(throws: Spake2pError.invalidEncoding) { _ = try respond(Data(count: 65)) }
-        // Invalid L as well.
-        #expect(throws: Spake2pError.notOnCurve) {
-            _ = try Verifier.respond(
-                context: ctx, idProver: idP, idVerifier: idV, w0: r.w0, l: flip(r.l, 64), shareP: shareP)
+        // An invalid stored L is its own error, whatever is wrong with it.
+        for badL in [flip(r.l, 64), Data(count: 65), r.l.prefix(64), r.l + Data([0])] {
+            #expect(throws: Spake2pError.invalidRecord) {
+                _ = try Verifier.respond(
+                    context: ctx, idProver: idP, idVerifier: idV, w0: r.w0, l: badL, shareP: shareP)
+            }
         }
     }
 

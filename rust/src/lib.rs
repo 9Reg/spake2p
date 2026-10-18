@@ -34,7 +34,7 @@
 //! // fixed array stands in for that output here.
 //! let pbkdf_output = [0x42u8; 80];
 //! let (w0, w1) = w0w1_from_pbkdf_output(&pbkdf_output)?;
-//! let l = register(&w1); // the Verifier stores (w0, l), never w1
+//! let l = register(&w1)?; // the Verifier stores (w0, l), never w1
 //!
 //! let (context, id_prover, id_verifier) = (b"my-app v1".as_slice(), b"client".as_slice(), b"server".as_slice());
 //!
@@ -61,12 +61,27 @@
 //!   with the same secrets.
 //! * Confirmation tags are compared in constant time. A failed confirmation returns
 //!   [`Error::ConfirmationFailed`] and no key material.
-//! * Secrets (`x`, `y`, `w0`, `w1`, `Z`, `V` and every derived key) are zeroised when dropped.
-//!   This is best effort: the compiler or operating system may have copied them elsewhere.
+//! * Secrets (`x`, `y`, `w0`, `w1`, the encoded `Z` and `V`, and every derived key) are zeroised
+//!   when dropped. This is best effort: the compiler or operating system may have copied them
+//!   elsewhere, and the curve-point objects of the underlying library are wiped only where this
+//!   crate holds them (`Z`, `V` and the unmasked point), not inside `p256`'s temporaries.
 //! * A SPAKE2+ run lets an active attacker test exactly one password guess per run. Applications
-//!   must rate-limit attempts and choose a memory-hard PBKDF.
+//!   must rate-limit attempts and choose a memory-hard PBKDF. See "Rate limiting" below.
+//! * A stored `L` can be checked at load time with [`L::parse`] or [`L::validate`]; a bad one is
+//!   then [`Error::InvalidRecord`], a local fault, never a bad peer share.
 //! * Identities are bound into the transcript. RFC 9383 recommends non-empty `id_prover` and
 //!   `id_verifier`; that is the application's to honour.
+//!
+//! ## Rate limiting
+//!
+//! This crate cannot count guesses for you, and what counts as a guess is not obvious. **Every
+//! call to [`Verifier::respond`], whatever its outcome, consumes one password guess of the peer**:
+//! the attacker receives `confirmV` (and tests its guess offline), or learns from a failure that
+//! its guess was exactly right, and then simply never sends `confirmP`. An application that counts
+//! only [`Verifier::finish`] failures gives an attacker unlimited guesses. Likewise every
+//! [`Prover::finish`] against a peer that has not yet proved itself consumes one guess of that
+//! peer. The application must keep a small budget of attempts per password, count them at
+//! `respond`, and rotate the password when the budget is spent.
 //!
 //! [RFC 9383]: https://www.rfc-editor.org/rfc/rfc9383.html
 
@@ -117,7 +132,9 @@ pub enum Error {
     /// A point was not in uncompressed SEC1 form (leading byte other than `0x04`): compressed,
     /// hybrid and identity encodings are all refused.
     InvalidEncoding,
-    /// A point was well-formed but is not on the P-256 curve.
+    /// A point was well-formed but is not on the P-256 curve. This is also the kind for a
+    /// non-canonical coordinate (a coordinate written as `x + p`, not reduced below the field
+    /// prime); Go reports both as `ErrInvalidPoint`, and both drivers as `invalid_point`.
     NotOnCurve,
     /// A received or computed point was the identity element.
     IdentityPoint,
@@ -130,6 +147,10 @@ pub enum Error {
     ConfirmationFailed,
     /// The operating system's random number generator failed.
     Rng,
+    /// The Verifier's stored `L` is not a valid point (wrong length, not uncompressed SEC1, not on
+    /// the curve, or the identity). A local fault with the stored record, never a bad peer share;
+    /// check records at load time with [`L::parse`].
+    InvalidRecord,
 }
 
 impl fmt::Display for Error {
@@ -143,6 +164,7 @@ impl fmt::Display for Error {
             Error::ZeroScalar => "scalar is zero",
             Error::ConfirmationFailed => "confirmation failed",
             Error::Rng => "random number generator failure",
+            Error::InvalidRecord => "stored verification value L is invalid",
         })
     }
 }
@@ -233,6 +255,25 @@ public_bytes!(
     SCALAR_LEN
 );
 
+impl L {
+    /// Parses a stored `L`: exactly 65 bytes, uncompressed SEC1, canonical coordinates, on the
+    /// curve, not the identity. Call it when loading a record, so a corrupted one is found before
+    /// any peer connects. Every failure is [`Error::InvalidRecord`].
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        let l = Self::from_bytes(bytes).map_err(|_| Error::InvalidRecord)?;
+        l.validate()?;
+        Ok(l)
+    }
+
+    /// Checks this `L` like [`L::parse`]: [`Error::InvalidRecord`] unless it is a valid,
+    /// non-identity point.
+    pub fn validate(&self) -> Result<()> {
+        decode_point(&self.0)
+            .map(|_| ())
+            .map_err(|_| Error::InvalidRecord)
+    }
+}
+
 /// Secret scalar newtypes (`w0`, `w1`): zeroised on drop, redacted in `Debug`.
 macro_rules! secret_scalar {
     ($(#[$meta:meta])* $name:ident) => {
@@ -309,11 +350,11 @@ fn scalar_from_bytes(bytes: &[u8; SCALAR_LEN]) -> Result<Scalar> {
 /// scalar arithmetic (Horner's rule, one byte at a time).
 fn scalar_reduce_be(bytes: &[u8]) -> Scalar {
     let base = Scalar::from(256u64);
-    let mut acc = Scalar::ZERO;
+    let mut acc = Zeroizing::new(Scalar::ZERO);
     for &b in bytes {
-        acc = acc * base + Scalar::from(u64::from(b));
+        *acc = *acc * base + Scalar::from(u64::from(b));
     }
-    acc
+    *acc
 }
 
 /// Splits an 80-byte PBKDF output into `(w0, w1)` (RFC 9383 §3.2).
@@ -326,17 +367,18 @@ pub fn w0w1_from_pbkdf_output(output: &[u8]) -> Result<(W0, W1)> {
     if output.len() != PBKDF_OUTPUT_LEN {
         return Err(Error::InvalidLength);
     }
-    let w0 = scalar_reduce_be(&output[..40]);
-    let w1 = scalar_reduce_be(&output[40..]);
+    let w0 = Zeroizing::new(scalar_reduce_be(&output[..40]));
+    let w1 = Zeroizing::new(scalar_reduce_be(&output[40..]));
     if bool::from(w0.is_zero()) || bool::from(w1.is_zero()) {
         return Err(Error::ZeroScalar);
     }
-    Ok((W0(w0), W1(w1)))
+    Ok((W0(*w0), W1(*w1)))
 }
 
-/// Computes the Verifier's registration point `L = w1·P`.
-pub fn register(w1: &W1) -> L {
-    L(encode_point(&(ProjectivePoint::GENERATOR * w1.0)))
+/// Computes the Verifier's registration point `L = w1·P`. `w1` is never zero, so the only error
+/// is the unreachable identity ([`Error::IdentityPoint`]), reported rather than panicking.
+pub fn register(w1: &W1) -> Result<L> {
+    Ok(L(encode_point(&(ProjectivePoint::GENERATOR * w1.0))?))
 }
 
 /// The RFC 9383 §3.2 recommended PBKDF input:
@@ -354,13 +396,11 @@ pub fn pbkdf_input(password: &[u8], id_prover: &[u8], id_verifier: &[u8]) -> Zer
 // Points
 // ---------------------------------------------------------------------------------------------
 
-/// Encodes a non-identity point as 65-byte uncompressed SEC1. Callers reject the identity first.
-fn encode_point(p: &ProjectivePoint) -> [u8; POINT_LEN] {
+/// Encodes a point as 65-byte uncompressed SEC1. The identity (whose encoding is a single byte)
+/// is [`Error::IdentityPoint`]; this function never panics.
+fn encode_point(p: &ProjectivePoint) -> Result<[u8; POINT_LEN]> {
     let enc = AffinePoint::from(*p).to_sec1_point(false);
-    let mut out = [0u8; POINT_LEN];
-    // Cannot panic: callers never pass the identity, whose encoding is a single byte.
-    out.copy_from_slice(enc.as_bytes());
-    out
+    <[u8; POINT_LEN]>::try_from(enc.as_bytes()).map_err(|_| Error::IdentityPoint)
 }
 
 /// Decodes and validates a received point: exactly 65 bytes, leading `0x04`, on the curve, and
@@ -429,11 +469,11 @@ fn derive(
     z: &ProjectivePoint,
     v: &ProjectivePoint,
     w0: &Scalar,
-) -> Derived {
-    let m = encode_point(&constant_point(&M_COMPRESSED));
-    let n = encode_point(&constant_point(&N_COMPRESSED));
-    let z_bytes = Zeroizing::new(encode_point(z));
-    let v_bytes = Zeroizing::new(encode_point(v));
+) -> Result<Derived> {
+    let m = encode_point(&constant_point(&M_COMPRESSED))?;
+    let n = encode_point(&constant_point(&N_COMPRESSED))?;
+    let z_bytes = Zeroizing::new(encode_point(z)?);
+    let v_bytes = Zeroizing::new(encode_point(v)?);
     let w0_bytes = Zeroizing::new(<[u8; 32]>::from(w0.to_bytes()));
 
     let mut tt = Zeroizing::new(Vec::with_capacity(
@@ -464,7 +504,7 @@ fn derive(
     k_confirm_p.copy_from_slice(&confirm_keys[..32]);
     k_confirm_v.copy_from_slice(&confirm_keys[32..]);
 
-    Derived {
+    Ok(Derived {
         #[cfg(test)]
         tt: tt.to_vec(),
         #[cfg(test)]
@@ -476,7 +516,7 @@ fn derive(
         k_confirm_p,
         k_confirm_v,
         k_shared,
-    }
+    })
 }
 
 fn hmac_tag(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {
@@ -491,12 +531,15 @@ fn tags_equal(a: &[u8; 32], b: &[u8; 32]) -> bool {
     bool::from(a.ct_eq(b))
 }
 
-/// A uniformly random non-zero scalar from the operating system's CSPRNG.
+/// A uniformly random non-zero scalar from the operating system's CSPRNG, by rejection sampling:
+/// 32 random bytes into a zeroising buffer, retried while the value is `>=` the group order or
+/// zero (about 2^-32 per draw). Rejection depends only on the discarded draw, so it leaks nothing
+/// about the accepted value, and no unwiped copy of the bytes is left behind.
 fn random_scalar() -> Result<Scalar> {
+    let mut buf = Zeroizing::new([0u8; SCALAR_LEN]);
     loop {
-        let s = Scalar::try_random(&mut getrandom::SysRng).map_err(|_| Error::Rng)?;
-        // x = 0 has probability 2^-256; resampling it costs nothing.
-        if !bool::from(s.is_zero()) {
+        getrandom::fill(&mut *buf).map_err(|_| Error::Rng)?;
+        if let Ok(s) = scalar_from_bytes(&buf) {
             return Ok(s);
         }
     }
@@ -534,14 +577,7 @@ impl Prover {
         w0: &W0,
         w1: &W1,
     ) -> Result<(Prover, ShareP)> {
-        Ok(Self::start_with_x(
-            context,
-            id_prover,
-            id_verifier,
-            w0,
-            w1,
-            random_scalar()?,
-        ))
+        Self::start_with_x(context, id_prover, id_verifier, w0, w1, random_scalar()?)
     }
 
     /// Like [`Prover::start`] with `x` supplied. Reachable only from tests.
@@ -555,7 +591,7 @@ impl Prover {
         x: &[u8; 32],
     ) -> (Prover, ShareP) {
         let x = scalar_from_bytes(x).expect("test x is a valid scalar");
-        Self::start_with_x(context, id_prover, id_verifier, w0, w1, x)
+        Self::start_with_x(context, id_prover, id_verifier, w0, w1, x).expect("test x is fine")
     }
 
     fn start_with_x(
@@ -565,11 +601,13 @@ impl Prover {
         w0: &W0,
         w1: &W1,
         x: Scalar,
-    ) -> (Prover, ShareP) {
+    ) -> Result<(Prover, ShareP)> {
         let m = constant_point(&M_COMPRESSED);
-        let big_x = ProjectivePoint::GENERATOR * x + m * w0.0;
-        // X is the identity only if x·P = -w0·M, which an honest random x makes negligible.
-        let share_p = encode_point(&big_x);
+        let w0m = Zeroizing::new(m * w0.0);
+        let big_x = ProjectivePoint::GENERATOR * x + *w0m;
+        // X is the identity only if x·P = -w0·M, which an honest random x makes negligible; it is
+        // an error, never a panic.
+        let share_p = encode_point(&reject_identity(big_x)?)?;
         let prover = Prover {
             context: context.to_vec(),
             id_prover: id_prover.to_vec(),
@@ -579,7 +617,7 @@ impl Prover {
             x,
             share_p,
         };
-        (prover, ShareP(share_p))
+        Ok((prover, ShareP(share_p)))
     }
 
     /// Finishes the exchange. Validates `share_v`, derives the keys, and checks `confirm_v` in
@@ -599,11 +637,12 @@ impl Prover {
         let y_pt = decode_point(&share_v.0)?;
         let n = constant_point(&N_COMPRESSED);
         // Y - w0·N
-        let diff = reject_identity(y_pt - n * self.w0)?;
+        let w0n = Zeroizing::new(n * self.w0);
+        let diff = Zeroizing::new(reject_identity(y_pt - *w0n)?);
         // h = 1 for P-256, so no cofactor multiplication.
-        let z = reject_identity(diff * self.x)?;
-        let v = reject_identity(diff * self.w1)?;
-        let derived = derive(
+        let z = Zeroizing::new(reject_identity(*diff * self.x)?);
+        let v = Zeroizing::new(reject_identity(*diff * self.w1)?);
+        derive(
             &self.context,
             &self.id_prover,
             &self.id_verifier,
@@ -612,8 +651,7 @@ impl Prover {
             &z,
             &v,
             &self.w0,
-        );
-        Ok(derived)
+        )
     }
 
     /// Test hook: everything derived for `share_v`, without checking any confirmation.
@@ -682,19 +720,22 @@ impl Verifier {
         y: Scalar,
     ) -> Result<(Verifier, ShareV, ConfirmV, Derived)> {
         let y = Zeroizing::new(y);
+        // A bad stored L is the application's own fault, not the peer's: its own error kind.
+        let l_pt = decode_point(&l.0).map_err(|_| Error::InvalidRecord)?;
         let x_pt = decode_point(&share_p.0)?;
-        let l_pt = decode_point(&l.0)?;
         let m = constant_point(&M_COMPRESSED);
         let n = constant_point(&N_COMPRESSED);
 
-        let big_y = ProjectivePoint::GENERATOR * *y + n * w0.0;
-        let share_v = encode_point(&reject_identity(big_y)?);
+        let w0n = Zeroizing::new(n * w0.0);
+        let w0m = Zeroizing::new(m * w0.0);
+        let big_y = ProjectivePoint::GENERATOR * *y + *w0n;
+        let share_v = encode_point(&reject_identity(big_y)?)?;
 
         // X - w0·M
-        let diff = reject_identity(x_pt - m * w0.0)?;
+        let diff = Zeroizing::new(reject_identity(x_pt - *w0m)?);
         // h = 1 for P-256, so no cofactor multiplication.
-        let z = reject_identity(diff * *y)?;
-        let v = reject_identity(l_pt * *y)?;
+        let z = Zeroizing::new(reject_identity(*diff * *y)?);
+        let v = Zeroizing::new(reject_identity(l_pt * *y)?);
 
         let derived = derive(
             context,
@@ -705,7 +746,7 @@ impl Verifier {
             &z,
             &v,
             &w0.0,
-        );
+        )?;
         let confirm_v = ConfirmV(hmac_tag(&derived.k_confirm_v, &share_p.0));
         let state = Verifier {
             share_v,

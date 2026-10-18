@@ -47,19 +47,28 @@ fn finish(result: Result<[u8; 32], String>) -> ! {
     }
 }
 
+/// Error kinds shared with the Go and Swift drivers (SPEC.md, "Driver contract"). A wrong length
+/// is a point problem for a share and a message problem for a confirmation tag, so the caller of
+/// `from_bytes` on a share uses [`point_kind`].
 fn kind(e: &Error) -> String {
     match e {
-        Error::InvalidLength => "invalid_length",
-        Error::InvalidEncoding => "invalid_encoding",
-        Error::NotOnCurve => "not_on_curve",
-        Error::IdentityPoint => "identity_point",
-        Error::ScalarOutOfRange => "scalar_out_of_range",
-        Error::ZeroScalar => "zero_scalar",
+        Error::InvalidLength => "invalid_message",
+        Error::InvalidEncoding | Error::NotOnCurve | Error::IdentityPoint => "invalid_point",
+        Error::InvalidRecord => "invalid_record",
+        Error::ScalarOutOfRange | Error::ZeroScalar => "invalid_scalar",
         Error::ConfirmationFailed => "confirmation_failed",
-        Error::Rng => "rng",
-        _ => "error",
+        Error::Rng => "random",
+        _ => "io",
     }
     .to_string()
+}
+
+/// The kind for an error on a received share: a bad length is an invalid point.
+fn point_kind(e: &Error) -> String {
+    match e {
+        Error::InvalidLength => "invalid_point".into(),
+        e => kind(e),
+    }
 }
 
 fn send(out: &mut impl Write, v: Value) {
@@ -71,8 +80,8 @@ fn send(out: &mut impl Write, v: Value) {
 fn recv(input: &mut impl BufRead) -> Result<Value, String> {
     let mut line = String::new();
     match input.read_line(&mut line) {
-        Ok(0) | Err(_) => Err("peer_closed".into()),
-        Ok(_) => serde_json::from_str(&line).map_err(|_| "bad_message".to_string()),
+        Ok(0) | Err(_) => Err("io".into()),
+        Ok(_) => serde_json::from_str(&line).map_err(|_| "io".to_string()),
     }
 }
 
@@ -80,7 +89,7 @@ fn hex_field(v: &Value, key: &str) -> Result<Vec<u8>, String> {
     v.get(key)
         .and_then(Value::as_str)
         .and_then(unhex)
-        .ok_or_else(|| "bad_message".to_string())
+        .ok_or_else(|| "io".to_string())
 }
 
 struct Config {
@@ -112,7 +121,10 @@ fn run_prover(cfg: Config) -> Result<[u8; 32], String> {
     send(&mut out, json!({"shareP": hex(share_p.as_bytes())}));
 
     let msg = recv(&mut input)?;
-    let share_v = ShareV::from_bytes(&hex_field(&msg, "shareV")?).map_err(|e| kind(&e))?;
+    if msg.get("abort").and_then(Value::as_bool) == Some(true) {
+        return Err("peer_aborted".into());
+    }
+    let share_v = ShareV::from_bytes(&hex_field(&msg, "shareV")?).map_err(|e| point_kind(&e))?;
     let confirm_v = ConfirmV::from_bytes(&hex_field(&msg, "confirmV")?).map_err(|e| kind(&e))?;
     match prover.finish(&share_v, &confirm_v) {
         Ok((confirm_p, key)) => {
@@ -130,7 +142,7 @@ fn run_verifier(cfg: Config) -> Result<[u8; 32], String> {
     // Derive w0 and L, then drop w1: the Verifier never keeps it.
     let (w0, l): (_, L) = {
         let (w0, w1) = w0w1_from_pbkdf_output(&cfg.pbkdf_output).map_err(|e| kind(&e))?;
-        let l = register(&w1);
+        let l = register(&w1).map_err(|e| kind(&e))?;
         (w0, l)
     };
     let stdin = io::stdin();
@@ -138,7 +150,10 @@ fn run_verifier(cfg: Config) -> Result<[u8; 32], String> {
     let mut out = io::stdout().lock();
 
     let msg = recv(&mut input)?;
-    let share_p = ShareP::from_bytes(&hex_field(&msg, "shareP")?).map_err(|e| kind(&e))?;
+    if msg.get("abort").and_then(Value::as_bool) == Some(true) {
+        return Err("peer_aborted".into());
+    }
+    let share_p = ShareP::from_bytes(&hex_field(&msg, "shareP")?).map_err(|e| point_kind(&e))?;
     let (verifier, share_v, confirm_v) = Verifier::respond(
         &cfg.context,
         &cfg.id_prover,

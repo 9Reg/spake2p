@@ -6,13 +6,15 @@ ciphersuite: **P256-SHA256-HKDF-SHA256-HMAC-SHA256**.
 SPAKE2+ lets two parties that share a short secret, such as a 6-digit pairing code, agree on a
 strong key and prove to each other that they know the secret. Nothing either side sends can be
 used to test password guesses offline: an attacker gets one guess per attempt, against a live peer.
+**Every Verifier `respond` counts as one guess, whatever its outcome**, so rate-limit there, not
+only on failed confirmations (see "Rate limiting" in [`SPEC.md`](SPEC.md)).
 The "+" makes it augmented: the Verifier stores a record derived from the password, not the
 password itself.
 
 | Directory | What | Built on |
 |---|---|---|
 | [`rust/`](rust/) | crate `spake2p` | RustCrypto `p256`, `sha2`, `hmac`, `hkdf` |
-| [`go/`](go/) | module `github.com/9Reg/spake2p/go` | `filippo.io/nistec`, Go standard library |
+| [`go/`](go/) | module `github.com/9Reg/spake2p/go` | `filippo.io/nistec`, Go standard library. Typed API: `W0`, `W1`, `L`, `ShareP`, `ShareV`, `ConfirmP`, `ConfirmV`; `ParseW0`/`ParseW1`/`ParseL` validate stored values; `Close()` wipes an abandoned exchange |
 | [`ffi/`](ffi/) | crate `spake2p-ffi` (C ABI, `include/spake2p.h`) | the Rust crate, as a static library |
 | [`swift/`](swift/) | package `Spake2p` | the Rust crate, through `ffi/` |
 

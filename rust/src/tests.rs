@@ -38,7 +38,7 @@ const IDV: &[u8] = b"server";
 /// w0, w1, L from a fixed pbkdf output; `seed` varies the password.
 fn creds(seed: u8) -> (W0, W1, L) {
     let (w0, w1) = w0w1_from_pbkdf_output(&[seed; 80]).unwrap();
-    let l = register(&w1);
+    let l = register(&w1).unwrap();
     (w0, w1, l)
 }
 
@@ -75,7 +75,7 @@ fn rfc_vector() {
     assert_eq!(v["idProver"].as_str().unwrap().as_bytes(), idp);
     assert_eq!(v["idVerifier"].as_str().unwrap().as_bytes(), idv);
 
-    let l = register(&w1);
+    let l = register(&w1).unwrap();
     assert_eq!(hex(l.as_bytes()), v["L"].as_str().unwrap());
 
     let (prover, share_p) =
@@ -122,8 +122,8 @@ fn constants_m_and_n_match_the_rfc_transcript() {
     // The vector's TT embeds M and N uncompressed; check ours match, independent of the flow.
     let v = vectors();
     let tt = hex(&field(&v, "TT"));
-    assert!(tt.contains(&hex(&encode_point(&constant_point(&M_COMPRESSED)))));
-    assert!(tt.contains(&hex(&encode_point(&constant_point(&N_COMPRESSED)))));
+    assert!(tt.contains(&hex(&encode_point(&constant_point(&M_COMPRESSED)).unwrap())));
+    assert!(tt.contains(&hex(&encode_point(&constant_point(&N_COMPRESSED)).unwrap())));
 }
 
 // 2. Round trip ----------------------------------------------------------------------------
@@ -425,11 +425,13 @@ fn off_curve_l_rejected() {
     let mut bad = *l.as_bytes();
     bad[64] ^= 0x01;
     let r = Verifier::respond(CTX, IDP, IDV, &w0, &L::from(bad), &share_p);
-    assert_eq!(r.unwrap_err(), Error::NotOnCurve);
+    assert_eq!(r.unwrap_err(), Error::InvalidRecord);
+    assert_eq!(L::parse(&bad).unwrap_err(), Error::InvalidRecord);
     let mut wrong_prefix = *l.as_bytes();
     wrong_prefix[0] = 0x02;
     let r = Verifier::respond(CTX, IDP, IDV, &w0, &L::from(wrong_prefix), &share_p);
-    assert_eq!(r.unwrap_err(), Error::InvalidEncoding);
+    assert_eq!(r.unwrap_err(), Error::InvalidRecord);
+    assert_eq!(L::parse(&wrong_prefix).unwrap_err(), Error::InvalidRecord);
 }
 
 #[test]
@@ -439,11 +441,91 @@ fn coordinate_not_below_field_prime_rejected() {
     assert!(respond_with(&s).is_err());
 }
 
+/// SP-4: the valid point with x = 0, written as x + p (non-canonical), and its canonical twin.
+const NON_CANONICAL: &str = "04ffffffff00000001000000000000000000000000ffffffffffffffffffffffff66485c780e2f83d72433bd5d84a06bb6541c2af31dae871728bf856a174f93f4";
+const CANONICAL: &str = "04000000000000000000000000000000000000000000000000000000000000000066485c780e2f83d72433bd5d84a06bb6541c2af31dae871728bf856a174f93f4";
+
+#[test]
+fn non_canonical_coordinate_rejected_everywhere() {
+    let nc: [u8; POINT_LEN] = arr(&unhex(NON_CANONICAL));
+    // As shareP and shareV: NotOnCurve is this crate's kind for a non-canonical coordinate.
+    assert_eq!(respond_with(&nc).unwrap_err(), Error::NotOnCurve);
+    assert_eq!(finish_with(&nc).unwrap_err(), Error::NotOnCurve);
+    // As a stored L: InvalidRecord.
+    assert_eq!(
+        L::parse(&unhex(NON_CANONICAL)).unwrap_err(),
+        Error::InvalidRecord
+    );
+    let (w0, w1, _) = creds(11);
+    let (_, share_p) = Prover::start(CTX, IDP, IDV, &w0, &w1).unwrap();
+    let r = Verifier::respond(CTX, IDP, IDV, &w0, &L::from(nc), &share_p);
+    assert_eq!(r.unwrap_err(), Error::InvalidRecord);
+}
+
+#[test]
+fn canonical_twin_of_the_non_canonical_point_is_accepted() {
+    let c: [u8; POINT_LEN] = arr(&unhex(CANONICAL));
+    respond_with(&c).unwrap();
+    // As shareV the point is accepted as a point; the zero confirmation then fails.
+    assert_eq!(finish_with(&c).unwrap_err(), Error::ConfirmationFailed);
+    L::parse(&c).unwrap();
+}
+
+#[test]
+fn negated_l_is_accepted() {
+    // SPEC test 6: a valid point's negation (-L) is accepted, by parse and by respond.
+    let (w0, w1, l) = creds(11);
+    let neg = encode_point(&-decode_point(l.as_bytes()).unwrap()).unwrap();
+    let neg_l = L::parse(&neg).unwrap();
+    let (_, share_p) = Prover::start(CTX, IDP, IDV, &w0, &w1).unwrap();
+    Verifier::respond(CTX, IDP, IDV, &w0, &neg_l, &share_p).unwrap();
+}
+
+#[test]
+fn l_parse_accepts_a_registered_l() {
+    let (_, _, l) = creds(11);
+    assert_eq!(L::parse(l.as_bytes()).unwrap(), l);
+    l.validate().unwrap();
+    for len in [0usize, 64, 66] {
+        assert_eq!(L::parse(&vec![4u8; len]).unwrap_err(), Error::InvalidRecord);
+    }
+}
+
+#[test]
+fn bad_stored_l_is_not_reported_as_a_bad_peer_share() {
+    let (w0, w1, l) = creds(11);
+    let (_, share_p) = Prover::start(CTX, IDP, IDV, &w0, &w1).unwrap();
+    let mut bad = *l.as_bytes();
+    bad[10] ^= 0x40;
+    let e = Verifier::respond(CTX, IDP, IDV, &w0, &L::from(bad), &share_p).unwrap_err();
+    assert_eq!(e, Error::InvalidRecord);
+    assert!(![
+        Error::InvalidEncoding,
+        Error::NotOnCurve,
+        Error::IdentityPoint
+    ]
+    .contains(&e));
+}
+
+#[test]
+fn prover_start_reports_an_identity_x_instead_of_panicking() {
+    // X = x·P + w0·M is the identity when x·P = -w0·M; only the discrete log of M would find
+    // such an x, so here the failure is exercised through encode_point and reject_identity.
+    assert_eq!(
+        encode_point(&ProjectivePoint::IDENTITY).unwrap_err(),
+        Error::IdentityPoint
+    );
+    assert_eq!(
+        reject_identity(ProjectivePoint::IDENTITY).unwrap_err(),
+        Error::IdentityPoint
+    );
+}
+
 #[test]
 fn share_equal_to_w0_m_rejected_by_verifier() {
     // X = w0·M, so X - w0·M is the identity.
     let (w0, _, l) = creds(11);
-    let x = encode_point(&(constant_point(&M_COMPRESSED) * w0.0));
+    let x = encode_point(&(constant_point(&M_COMPRESSED) * w0.0)).unwrap();
     let r = Verifier::respond(CTX, IDP, IDV, &w0, &l, &ShareP::from(x));
     assert_eq!(r.unwrap_err(), Error::IdentityPoint);
 }
@@ -453,7 +535,7 @@ fn share_equal_to_w0_n_rejected_by_prover() {
     // Y = w0·N, so Y - w0·N is the identity.
     let (w0, w1, _) = creds(11);
     let (prover, _) = Prover::start(CTX, IDP, IDV, &w0, &w1).unwrap();
-    let y = encode_point(&(constant_point(&N_COMPRESSED) * w0.0));
+    let y = encode_point(&(constant_point(&N_COMPRESSED) * w0.0)).unwrap();
     let r = prover.finish(&ShareV::from(y), &ConfirmV::from([0u8; 32]));
     assert_eq!(r.unwrap_err(), Error::IdentityPoint);
 }
@@ -463,7 +545,7 @@ fn negation_tricks_do_not_yield_the_identity_or_a_key() {
     // X = -w0·M (the negation of the identity-producing share) is a valid, non-identity point:
     // the Verifier must not treat it as the degenerate case, and the result must not confirm.
     let (w0, w1, l) = creds(11);
-    let x = encode_point(&-(constant_point(&M_COMPRESSED) * w0.0));
+    let x = encode_point(&-(constant_point(&M_COMPRESSED) * w0.0)).unwrap();
     let (_v, share_v, confirm_v) =
         Verifier::respond(CTX, IDP, IDV, &w0, &l, &ShareP::from(x)).unwrap();
     let (prover, _) = Prover::start(CTX, IDP, IDV, &w0, &w1).unwrap();
@@ -473,7 +555,7 @@ fn negation_tricks_do_not_yield_the_identity_or_a_key() {
     );
 
     // The generator's negation as a share: valid curve point, no special case, no panic.
-    let neg_g = encode_point(&-ProjectivePoint::GENERATOR);
+    let neg_g = encode_point(&-ProjectivePoint::GENERATOR).unwrap();
     let _ = Verifier::respond(CTX, IDP, IDV, &w0, &l, &ShareP::from(neg_g));
     let (prover, _) = Prover::start(CTX, IDP, IDV, &w0, &w1).unwrap();
     let r = prover.finish(&ShareV::from(neg_g), &ConfirmV::from([0u8; 32]));
@@ -485,7 +567,11 @@ fn identity_l_is_not_encodable_and_zero_l_rejected() {
     let (w0, w1, _) = creds(11);
     let (_, share_p) = Prover::start(CTX, IDP, IDV, &w0, &w1).unwrap();
     let r = Verifier::respond(CTX, IDP, IDV, &w0, &L::from([0u8; POINT_LEN]), &share_p);
-    assert_eq!(r.unwrap_err(), Error::InvalidEncoding);
+    assert_eq!(r.unwrap_err(), Error::InvalidRecord);
+    assert_eq!(
+        L::parse(&[0u8; POINT_LEN]).unwrap_err(),
+        Error::InvalidRecord
+    );
 }
 
 #[test]
@@ -528,7 +614,7 @@ fn order_plus(delta: u8) -> [u8; 32] {
 
 #[test]
 fn pbkdf_output_reduction_known_values() {
-    // 40-byte half = n (reduces to 0) is rejected; n + 5 reduces to 5; n - 1 stays n - 1.
+    // n + 5 reduces to 5; n - 1 stays n - 1.
     let mut out = [0u8; 80];
     let mut half = [0u8; 40];
     half[8..].copy_from_slice(&order_plus(5));
@@ -580,6 +666,22 @@ fn pbkdf_output_wrong_lengths_rejected() {
             Error::InvalidLength
         );
     }
+}
+
+#[test]
+fn pbkdf_output_half_equal_to_n_is_zero_scalar() {
+    // A 40-byte half equal to n reduces to zero, which is an error (not a silent w = 0).
+    let mut half = [0u8; 40];
+    half[8..].copy_from_slice(&ORDER);
+    let mut one = [0u8; 40];
+    one[39] = 1;
+    let mut out = [0u8; 80];
+    out[..40].copy_from_slice(&half);
+    out[40..].copy_from_slice(&one);
+    assert_eq!(w0w1_from_pbkdf_output(&out).unwrap_err(), Error::ZeroScalar);
+    out[..40].copy_from_slice(&one);
+    out[40..].copy_from_slice(&half);
+    assert_eq!(w0w1_from_pbkdf_output(&out).unwrap_err(), Error::ZeroScalar);
 }
 
 #[test]

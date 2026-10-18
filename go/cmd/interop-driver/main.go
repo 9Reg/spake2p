@@ -57,10 +57,13 @@ func kind(err error) string {
 	}{
 		{spake2p.ErrConfirmationFailed, "confirmation_failed"},
 		{spake2p.ErrInvalidPoint, "invalid_point"},
+		{spake2p.ErrInvalidRecord, "invalid_record"},
+		{errPeerAborted, "peer_aborted"},
 		{spake2p.ErrInvalidMessage, "invalid_message"},
 		{spake2p.ErrInvalidScalar, "invalid_scalar"},
 		{spake2p.ErrInvalidPBKDFOutput, "invalid_pbkdf_output"},
 		{spake2p.ErrFinished, "finished"},
+		{spake2p.ErrInvalidState, "invalid_state"},
 		{spake2p.ErrRandom, "random"},
 	} {
 		if errors.Is(err, k.e) {
@@ -139,7 +142,7 @@ func run() int {
 		if err != nil || aborted {
 			return outcome(nil, orIO(err))
 		}
-		confirmP, key, err := p.Finish(m["shareV"], m["confirmV"])
+		confirmP, key, err := p.Finish(spake2p.ShareV(m["shareV"]), spake2p.ConfirmV(m["confirmV"]))
 		if err != nil {
 			_ = send(map[string]any{"abort": true})
 			return outcome(nil, err)
@@ -164,6 +167,7 @@ func run() int {
 	if err != nil {
 		return outcome(nil, err)
 	}
+	defer v.Close()
 	if err := send(map[string]any{"shareV": hex.EncodeToString(shareV), "confirmV": hex.EncodeToString(confirmV)}); err != nil {
 		return outcome(nil, err)
 	}
@@ -171,13 +175,16 @@ func run() int {
 	if err != nil || aborted {
 		return outcome(nil, orIO(err))
 	}
-	key, err := v.Finish(m["confirmP"])
+	key, err := v.Finish(spake2p.ConfirmP(m["confirmP"]))
 	return outcome(key, err)
 }
 
+// errPeerAborted: the peer sent {"abort": true} (SPEC.md, Driver contract).
+var errPeerAborted = errors.New("peer aborted")
+
 func orIO(err error) error {
 	if err == nil {
-		return errors.New("peer aborted")
+		return errPeerAborted
 	}
 	return err
 }

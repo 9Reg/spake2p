@@ -28,15 +28,14 @@ func unhex(_ s: String) -> Data? {
 
 func kind(_ e: Spake2pError) -> String {
     switch e {
-    case .invalidLength: "invalid_length"
-    case .invalidEncoding: "invalid_encoding"
-    case .notOnCurve: "not_on_curve"
-    case .identityPoint: "identity_point"
-    case .scalarOutOfRange: "scalar_out_of_range"
-    case .zeroScalar: "zero_scalar"
+    case .invalidLength: "invalid_message"
+    case .invalidEncoding, .notOnCurve, .identityPoint: "invalid_point"
+    case .invalidRecord: "invalid_record"
+    case .scalarOutOfRange, .zeroScalar: "invalid_scalar"
     case .confirmationFailed: "confirmation_failed"
-    case .rng: "rng"
-    case .alreadyFinished, .unexpected: "error"
+    case .rng: "random"
+    case .alreadyFinished: "finished"
+    case .unexpected: "io"
     }
 }
 
@@ -55,15 +54,15 @@ func send(_ fields: [(String, Any)]) {
 }
 
 func recv() throws -> [String: Any] {
-    guard let line = readLine(strippingNewline: true) else { throw Failure(kind: "peer_closed") }
+    guard let line = readLine(strippingNewline: true) else { throw Failure(kind: "io") }
     guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else {
-        throw Failure(kind: "bad_message")
+        throw Failure(kind: "io")
     }
     return obj
 }
 
 func hexField(_ m: [String: Any], _ key: String) throws -> Data {
-    guard let s = m[key] as? String, let d = unhex(s) else { throw Failure(kind: "bad_message") }
+    guard let s = m[key] as? String, let d = unhex(s) else { throw Failure(kind: "io") }
     return d
 }
 
@@ -88,7 +87,9 @@ func runProver(_ cfg: Config) throws -> Data {
             context: cfg.context, idProver: cfg.idProver, idVerifier: cfg.idVerifier, w0: w0, w1: w1)
         send([("shareP", hex(shareP))])
         let msg = try recv()
+        if msg["abort"] as? Bool == true { throw Failure(kind: "peer_aborted") }
         let shareV = try hexField(msg, "shareV"), confirmV = try hexField(msg, "confirmV")
+        guard shareV.count == 65 else { throw Failure(kind: "invalid_point") }
         do {
             let (confirmP, key) = try prover.finish(shareV: shareV, confirmV: confirmV)
             send([("confirmP", hex(confirmP))])
@@ -109,7 +110,10 @@ func runVerifier(_ cfg: Config) throws -> Data {
             let (w0, w1) = try Spake2p.w0w1(fromPBKDFOutput: cfg.pbkdfOutput)
             return (w0, try Spake2p.register(w1: w1))
         }()
-        let shareP = try hexField(try recv(), "shareP")
+        let first = try recv()
+        if first["abort"] as? Bool == true { throw Failure(kind: "peer_aborted") }
+        let shareP = try hexField(first, "shareP")
+        guard shareP.count == 65 else { throw Failure(kind: "invalid_point") }
         let (verifier, shareV, confirmV) = try Verifier.respond(
             context: cfg.context, idProver: cfg.idProver, idVerifier: cfg.idVerifier,
             w0: w0, l: l, shareP: shareP)
@@ -137,5 +141,5 @@ do {
 } catch let f as Failure {
     report("{\"ok\": false, \"error\": \"\(f.kind)\"}", exit: 1)
 } catch {
-    report("{\"ok\": false, \"error\": \"error\"}", exit: 1)
+    report("{\"ok\": false, \"error\": \"io\"}", exit: 1)
 }

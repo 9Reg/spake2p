@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"math/big"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"filippo.io/nistec"
@@ -54,11 +56,11 @@ func eq(t *testing.T, name string, got, want []byte) {
 // Test 1: RFC 9383 Appendix C, byte for byte, with x and y injected.
 func TestRFCVector(t *testing.T) {
 	v := loadVector(t)
-	w0, err := ParseScalar(v.W0)
+	w0, err := ParseW0(v.W0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	w1, err := ParseScalar(v.W1)
+	w1, err := ParseW1(v.W1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +68,7 @@ func TestRFCVector(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	eq(t, "L", l, v.L)
+	eq(t, "L", l.Bytes(), v.L)
 
 	prover, shareP, err := startProver(v.Context, v.IDProver, v.IDVerifier, w0, w1, bytes.Clone(v.X))
 	if err != nil {
@@ -112,8 +114,9 @@ func TestRFCVector(t *testing.T) {
 
 // pair holds a registered password for the remaining tests.
 type pair struct {
-	w0, w1 *Scalar
-	l      []byte
+	w0 *W0
+	w1 *W1
+	l  *L
 }
 
 func register(t testing.TB, seed byte) pair {
@@ -308,6 +311,8 @@ func TestInvalidPoints(t *testing.T) {
 		"empty":             nil,
 		"off curve":         offCurve,
 		"x >= p":            append([]byte{0x04}, bytes.Repeat([]byte{0xff}, 64)...),
+		// SP-4: the valid point with x = 0, written as x + p.
+		"non-canonical x+p": unhex(t, nonCanonicalHex),
 	}
 	// A share equal to w0·M (so X - w0·M is the identity) and w0·N.
 	w0M := mul(t, pointM, pw.w0.b[:]).Bytes()
@@ -317,8 +322,8 @@ func TestInvalidPoints(t *testing.T) {
 		if _, _, _, err := RespondVerifier(ctx, idP, idV, pw.w0, pw.l, bad); err != ErrInvalidPoint {
 			t.Errorf("verifier shareP %s: %v", name, err)
 		}
-		if _, _, _, err := RespondVerifier(ctx, idP, idV, pw.w0, bad, goodShare); err != ErrInvalidPoint {
-			t.Errorf("verifier L %s: %v", name, err)
+		if _, err := ParseL(bad); err != ErrInvalidRecord {
+			t.Errorf("ParseL %s: %v", name, err)
 		}
 		p, _ := good()
 		if _, _, err := p.Finish(bad, make([]byte, 32)); err != ErrInvalidPoint {
@@ -335,10 +340,47 @@ func TestInvalidPoints(t *testing.T) {
 	// Negation: -L and -X are valid points and must not crash; the exchange
 	// then simply fails or yields different keys, never the identity.
 	neg := nistec.NewP256Point()
-	lp, _ := decodePoint(pw.l)
-	negL := neg.Negate(lp).Bytes()
+	lp, _ := decodePoint(pw.l.b[:])
+	negL, err := ParseL(neg.Negate(lp).Bytes())
+	if err != nil {
+		t.Fatalf("valid negated L rejected: %v", err)
+	}
 	if _, _, _, err := RespondVerifier(ctx, idP, idV, pw.w0, negL, goodShare); err != nil {
-		t.Errorf("valid negated L rejected: %v", err)
+		t.Errorf("valid negated L rejected by respond: %v", err)
+	}
+}
+
+const (
+	// SP-4: the valid point with x = 0 and y = 66485c78..., with x written as
+	// x + p (non-canonical), and its canonical twin.
+	nonCanonicalHex = "04ffffffff00000001000000000000000000000000ffffffffffffffffffffffff66485c780e2f83d72433bd5d84a06bb6541c2af31dae871728bf856a174f93f4"
+	canonicalHex    = "040000000000000000000000000000000000000000000000000000000000000000" + "66485c780e2f83d72433bd5d84a06bb6541c2af31dae871728bf856a174f93f4"
+)
+
+// SP-4: the canonical encoding is accepted as shareP, shareV and L; the
+// non-canonical twin is rejected in all three places (see TestInvalidPoints).
+func TestCanonicalTwinAccepted(t *testing.T) {
+	pw := register(t, 1)
+	canon := unhex(t, canonicalHex)
+	if _, err := ParseL(canon); err != nil {
+		t.Errorf("canonical L rejected: %v", err)
+	}
+	if _, err := ParseL(unhex(t, nonCanonicalHex)); err != ErrInvalidRecord {
+		t.Errorf("non-canonical L: %v", err)
+	}
+	if _, _, _, err := RespondVerifier(ctx, idP, idV, pw.w0, pw.l, canon); err != nil {
+		t.Errorf("canonical shareP rejected: %v", err)
+	}
+	if _, _, _, err := RespondVerifier(ctx, idP, idV, pw.w0, pw.l, unhex(t, nonCanonicalHex)); err != ErrInvalidPoint {
+		t.Errorf("non-canonical shareP: %v", err)
+	}
+	p, _, _ := StartProver(ctx, idP, idV, pw.w0, pw.w1)
+	if _, _, err := p.Finish(canon, make([]byte, 32)); err != ErrConfirmationFailed {
+		t.Errorf("canonical shareV not accepted as a point: %v", err)
+	}
+	p, _, _ = StartProver(ctx, idP, idV, pw.w0, pw.w1)
+	if _, _, err := p.Finish(unhex(t, nonCanonicalHex), make([]byte, 32)); err != ErrInvalidPoint {
+		t.Errorf("non-canonical shareV: %v", err)
 	}
 }
 
@@ -403,9 +445,13 @@ func TestRegistration(t *testing.T) {
 		"n": {nb, false}, "n+1": {np1, false}, "all ff": {bytes.Repeat([]byte{0xff}, 32), false},
 		"31 bytes": {one[1:], false}, "33 bytes": {append([]byte{0}, one...), false}, "nil": {nil, false},
 	} {
-		s, err := ParseScalar(c.in)
-		if c.ok != (err == nil) || (err != nil && err != ErrInvalidScalar) || (c.ok && s == nil) {
-			t.Errorf("ParseScalar %s: %v", name, err)
+		s0, err := ParseW0(c.in)
+		if c.ok != (err == nil) || (err != nil && err != ErrInvalidScalar) || (c.ok && s0 == nil) {
+			t.Errorf("ParseW0 %s: %v", name, err)
+		}
+		s1, err := ParseW1(c.in)
+		if c.ok != (err == nil) || (err != nil && err != ErrInvalidScalar) || (c.ok && s1 == nil) {
+			t.Errorf("ParseW1 %s: %v", name, err)
 		}
 	}
 	if _, err := Register(nil); err != ErrInvalidScalar {
@@ -468,7 +514,7 @@ func TestSecretsWiped(t *testing.T) {
 }
 
 func TestErrorTextHasNoSecrets(t *testing.T) {
-	for _, e := range []error{ErrInvalidScalar, ErrInvalidPBKDFOutput, ErrInvalidPoint, ErrInvalidMessage, ErrConfirmationFailed, ErrFinished, ErrRandom} {
+	for _, e := range []error{ErrInvalidScalar, ErrInvalidPBKDFOutput, ErrInvalidPoint, ErrInvalidMessage, ErrConfirmationFailed, ErrFinished, ErrRandom, ErrInvalidRecord, ErrInvalidState} {
 		if len(e.Error()) > 60 {
 			t.Errorf("suspiciously long error text: %q", e)
 		}
@@ -482,4 +528,233 @@ func mul(t testing.TB, p *nistec.P256Point, s []byte) *nistec.P256Point {
 		t.Fatal(err)
 	}
 	return r
+}
+
+// SP-1: an all-zero w0 or w1 is rejected by every entry point, however it was
+// produced; Zero() leaves a value that the check catches.
+func TestZeroScalarsRejected(t *testing.T) {
+	pw := register(t, 1)
+	_, goodShare, _ := StartProver(ctx, idP, idV, pw.w0, pw.w1)
+	zeroW0, zeroW1 := new(W0), new(W1)
+	wiped0, wiped1 := &W0{pw.w0.b}, &W1{pw.w1.b}
+	wiped0.Zero()
+	wiped1.Zero()
+	for name, w0 := range map[string]*W0{"new": zeroW0, "wiped": wiped0, "nil": nil} {
+		if _, _, _, err := RespondVerifier(ctx, idP, idV, w0, pw.l, goodShare); err != ErrInvalidScalar {
+			t.Errorf("RespondVerifier w0 %s: %v", name, err)
+		}
+		if _, _, err := StartProver(ctx, idP, idV, w0, pw.w1); err != ErrInvalidScalar {
+			t.Errorf("StartProver w0 %s: %v", name, err)
+		}
+	}
+	for name, w1 := range map[string]*W1{"new": zeroW1, "wiped": wiped1, "nil": nil} {
+		if _, _, err := StartProver(ctx, idP, idV, pw.w0, w1); err != ErrInvalidScalar {
+			t.Errorf("StartProver w1 %s: %v", name, err)
+		}
+		if _, err := Register(w1); err != ErrInvalidScalar {
+			t.Errorf("Register w1 %s: %v", name, err)
+		}
+	}
+	if !isZero(wiped0.b[:]) || isZero(pw.w0.b[:]) {
+		t.Error("isZero wrong")
+	}
+	// Marshalling an invalid value fails too.
+	if _, err := zeroW0.MarshalBinary(); err != ErrInvalidScalar {
+		t.Errorf("MarshalBinary zero W0: %v", err)
+	}
+	if _, err := zeroW1.MarshalJSON(); err != ErrInvalidScalar {
+		t.Errorf("MarshalJSON zero W1: %v", err)
+	}
+}
+
+// SP-1: a stored struct holding a W0, W1 or L cannot silently decode to a zero
+// value: the hex form goes through the parsers, and a missing field stays zero
+// and is rejected at use.
+func TestJSONCannotYieldZeroScalar(t *testing.T) {
+	pw := register(t, 1)
+	type record struct {
+		W0 W0 `json:"w0"`
+		W1 W1 `json:"w1"`
+		L  L  `json:"l"`
+	}
+	in := record{*pw.w0, *pw.w1, *pw.l}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out record
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out != in {
+		t.Error("JSON round trip changed the record")
+	}
+	zero := `"` + string(bytes.Repeat([]byte("0"), 64)) + `"`
+	for name, doc := range map[string]string{
+		"all-zero w0": `{"w0":` + zero + `}`,
+		"all-zero w1": `{"w1":` + zero + `}`,
+		"empty obj":   `{"w0":{}}`,
+		"number":      `{"w0":0}`,
+		"short hex":   `{"w0":"00"}`,
+		"bad hex":     `{"w1":"zz"}`,
+		"zero L":      `{"l":"` + string(bytes.Repeat([]byte("0"), 130)) + `"}`,
+		"w0 = n":      `{"w0":"` + hex.EncodeToString(p256Order) + `"}`,
+	} {
+		var r record
+		if err := json.Unmarshal([]byte(doc), &r); err == nil {
+			t.Errorf("%s: decoded without error", name)
+		}
+	}
+	// A field that is absent stays zero, and every entry point rejects it.
+	var absent record
+	if err := json.Unmarshal([]byte(`{}`), &absent); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := StartProver(ctx, idP, idV, &absent.W0, &absent.W1); err != ErrInvalidScalar {
+		t.Errorf("absent field accepted: %v", err)
+	}
+	_, goodShare, _ := StartProver(ctx, idP, idV, pw.w0, pw.w1)
+	if _, _, _, err := RespondVerifier(ctx, idP, idV, pw.w0, &absent.L, goodShare); err != ErrInvalidRecord {
+		t.Errorf("absent L accepted: %v", err)
+	}
+	// Binary form.
+	var w W0
+	if err := w.UnmarshalBinary(make([]byte, 32)); err != ErrInvalidScalar {
+		t.Errorf("UnmarshalBinary zero: %v", err)
+	}
+	b, _ := pw.w0.MarshalBinary()
+	if err := w.UnmarshalBinary(b); err != nil || !bytes.Equal(w.Bytes(), b) {
+		t.Errorf("UnmarshalBinary: %v", err)
+	}
+}
+
+// SP-5: zero-value states return a sentinel and never panic.
+func TestZeroValueStates(t *testing.T) {
+	var v Verifier
+	if _, err := v.Finish(make([]byte, 32)); err != ErrInvalidState {
+		t.Errorf("zero Verifier: %v", err)
+	}
+	var p Prover
+	if _, _, err := p.Finish(make([]byte, 65), make([]byte, 32)); err != ErrInvalidState {
+		t.Errorf("zero Prover: %v", err)
+	}
+	var v2 Verifier
+	v2.Close()
+	if _, err := v2.Finish(nil); err != ErrFinished {
+		t.Errorf("closed zero Verifier: %v", err)
+	}
+	var p2 Prover
+	p2.Close()
+	if _, _, err := p2.Finish(nil, nil); err != ErrFinished {
+		t.Errorf("closed zero Prover: %v", err)
+	}
+}
+
+// SP-6: a bad stored L is its own error, never a bad-peer error.
+func TestInvalidRecord(t *testing.T) {
+	pw := register(t, 1)
+	_, shareP, _ := StartProver(ctx, idP, idV, pw.w0, pw.w1)
+	for name, l := range map[string]*L{"nil": nil, "zero": new(L)} {
+		if _, _, _, err := RespondVerifier(ctx, idP, idV, pw.w0, l, shareP); err != ErrInvalidRecord {
+			t.Errorf("%s L: %v", name, err)
+		}
+	}
+	bad := pw.l.Bytes()
+	bad[64] ^= 1 // off curve
+	if _, err := ParseL(bad); err != ErrInvalidRecord {
+		t.Errorf("off-curve L: %v", err)
+	}
+	if l, err := ParseL(pw.l.Bytes()); err != nil || !bytes.Equal(l.Bytes(), pw.l.Bytes()) {
+		t.Errorf("valid L: %v", err)
+	}
+}
+
+// SP-3: Close wipes an abandoned state, is idempotent, and consumes it.
+func TestClose(t *testing.T) {
+	pw := register(t, 1)
+	p, shareP, _ := StartProver(ctx, idP, idV, pw.w0, pw.w1)
+	v, shareV, confirmV, err := RespondVerifier(ctx, idP, idV, pw.w0, pw.l, shareP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := v.t
+	if isZero(tr.kShared) || isZero(tr.kMain) {
+		t.Fatal("keys already zero")
+	}
+	v.Close()
+	v.Close()
+	p.Close()
+	p.Close()
+	zero := make([]byte, 32)
+	for name, b := range map[string][]byte{"kShared": tr.kShared, "kMain": tr.kMain, "kConfirmP": tr.kConfirmP,
+		"kConfirmV": tr.kConfirmV, "x": p.x, "w0": p.w0, "w1": p.w1} {
+		if !bytes.Equal(b, zero) && !isZero(b) {
+			t.Errorf("%s not wiped", name)
+		}
+	}
+	if !isZero(tr.tt) || !isZero(tr.z) || !isZero(tr.v) {
+		t.Error("transcript not wiped")
+	}
+	if _, err := v.Finish(tr.confirmP); err != ErrFinished {
+		t.Errorf("Finish after Close: %v", err)
+	}
+	if _, _, err := p.Finish(shareV, confirmV); err != ErrFinished {
+		t.Errorf("prover Finish after Close: %v", err)
+	}
+}
+
+// SP-7: concurrent Finish calls with the right tag give exactly one success,
+// and the successful key is never a wiped one.
+func TestConcurrentFinish(t *testing.T) {
+	pw := register(t, 1)
+	for round := 0; round < 50; round++ {
+		p, shareP, _ := StartProver(ctx, idP, idV, pw.w0, pw.w1)
+		v, shareV, confirmV, err := RespondVerifier(ctx, idP, idV, pw.w0, pw.l, shareP)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var confirmP ConfirmP
+		var wg sync.WaitGroup
+		var okP, okV atomic.Int32
+		type res struct {
+			cp ConfirmP
+			k  []byte
+		}
+		resP := make(chan res, 8)
+		resV := make(chan []byte, 8)
+		start := make(chan struct{})
+		for i := 0; i < 8; i++ {
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				<-start
+				if cp, k, err := p.Finish(shareV, confirmV); err == nil {
+					okP.Add(1)
+					resP <- res{cp, k}
+				}
+			}()
+			go func() {
+				defer wg.Done()
+				<-start
+				// The right tag needs the prover's output; compute it from the verifier's trace.
+				if k, err := v.Finish(v.t.confirmP); err == nil {
+					okV.Add(1)
+					resV <- k
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(resP)
+		close(resV)
+		if okP.Load() != 1 || okV.Load() != 1 {
+			t.Fatalf("round %d: successes prover %d verifier %d", round, okP.Load(), okV.Load())
+		}
+		r := <-resP
+		confirmP = r.cp
+		kv := <-resV
+		if isZero(kv) || isZero(r.k) || !bytes.Equal(kv, r.k) || len(confirmP) != ConfirmSize {
+			t.Fatalf("round %d: bad keys", round)
+		}
+	}
 }

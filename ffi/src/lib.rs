@@ -43,6 +43,9 @@ pub const SPAKE2P_ERR_CONFIRMATION_FAILED: Spake2pStatus = 7;
 pub const SPAKE2P_ERR_RNG: Spake2pStatus = 8;
 /// A `spake2p::Error` variant this ABI version does not know.
 pub const SPAKE2P_ERR_UNKNOWN: Spake2pStatus = 9;
+/// The stored verification value `L` is not a valid point: a local fault, never a bad peer share
+/// ([`spake2p::Error::InvalidRecord`]). Appended after `SPAKE2P_ERR_UNKNOWN`; no code was renumbered.
+pub const SPAKE2P_ERR_INVALID_RECORD: Spake2pStatus = 10;
 /// A required pointer was NULL.
 pub const SPAKE2P_ERR_NULL_POINTER: Spake2pStatus = 100;
 /// An output buffer was smaller than the documented output size.
@@ -65,6 +68,7 @@ fn status_of(e: Error) -> Spake2pStatus {
         Error::ZeroScalar => SPAKE2P_ERR_ZERO_SCALAR,
         Error::ConfirmationFailed => SPAKE2P_ERR_CONFIRMATION_FAILED,
         Error::Rng => SPAKE2P_ERR_RNG,
+        Error::InvalidRecord => SPAKE2P_ERR_INVALID_RECORD,
         _ => SPAKE2P_ERR_UNKNOWN,
     }
 }
@@ -180,7 +184,7 @@ pub unsafe extern "C" fn spake2p_register(
         // SAFETY: caller contract.
         let w1 = W1::from_bytes(unsafe { input(w1, w1_len)? })?;
         let out = Out::new(l_out, l_cap, POINT_LEN)?;
-        let l = spake2p::register(&w1);
+        let l = spake2p::register(&w1)?;
         // SAFETY: `out` checked; `l` is local.
         unsafe { out.write(l.as_bytes()) };
         Ok(())
@@ -398,7 +402,8 @@ pub unsafe extern "C" fn spake2p_verifier_respond(
         let o_sv = Out::new(share_v_out, share_v_cap, POINT_LEN)?;
         let o_cv = Out::new(confirm_v_out, confirm_v_cap, SCALAR_LEN)?;
         let w0 = W0::from_bytes(w0b)?;
-        let l = L::from_bytes(lb)?;
+        // Any problem with the stored L (length included) is SPAKE2P_ERR_INVALID_RECORD.
+        let l = L::parse(lb)?;
         let share_p = ShareP::from_bytes(spb)?;
         let (verifier, share_v, confirm_v) = Verifier::respond(ctx, idp, idv, &w0, &l, &share_p)?;
         // SAFETY: outputs checked; `out_verifier` non-NULL and writable (checked above).

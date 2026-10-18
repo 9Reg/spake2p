@@ -27,16 +27,33 @@ verifierKey, err := verifier.Finish(confirmP)               // equal to proverKe
 
 `example_test.go` is a runnable version. Handle every error; ignoring them as above is shorthand.
 
+## Types
+
+Values that must not be mixed up have distinct types: `W0` and `W1` (password-derived scalars,
+never zero or >= n), `L` (the stored verification value, a valid non-identity point), and the peer
+messages `ShareP`, `ShareV`, `ConfirmP`, `ConfirmV` (named byte slices). Load stored values with
+`ParseW0`, `ParseW1` and `ParseL`, which validate at load time (`ErrInvalidScalar`,
+`ErrInvalidRecord`). `W0`, `W1` and `L` marshal to binary and JSON.
+
+`Prover.Close()` and `Verifier.Close()` wipe every secret the state holds and consume it (a later
+`Finish` returns `ErrFinished`). They are idempotent; use `defer p.Close()` so an abandoned
+exchange does not leave secrets behind. `Finish` calls it itself.
+
 ## Security notes
 
 - The PBKDF that turns a password into the 80 bytes is yours to choose (use a memory-hard one such as
   scrypt or Argon2id). SPAKE2+ limits an attacker to one guess per run; it does not make a weak
   password strong.
+- **Every `RespondVerifier` call counts as one guess, whatever its outcome**: the attacker either
+  receives `confirmV` to test offline, or learns from a failure that its guess was right and never
+  sends `confirmP`. Counting only `Verifier.Finish` failures gives unlimited guesses. Likewise every
+  `Prover.Finish` against a peer that has not proved itself. Keep a small attempt budget per
+  password and count at `RespondVerifier`.
 - Shares and `L` are validated: exactly 65 bytes, `0x04` prefix, on the curve, and the identity is
   rejected wherever it can appear (including `Y - w0·N`, `X - w0·M`, `Z`, `V`).
 - `Finish` is single use. Any failure consumes the state; start a new exchange to retry. A failed
   `Prover.Finish` returns no keys. Confirmation tags are compared with `hmac.Equal`.
-- `x` and `y` are drawn from `crypto/rand` by rejection sampling over `[0, n-1]`.
+- `x` and `y` are drawn from `crypto/rand` by rejection sampling: 32 bytes, retried while the value is >= n or zero.
 - Secret slices are zeroed after use on a best-effort basis; Go's garbage collector may have copied
   them already.
 - Run one exchange per connection and bind `context` to your application and protocol version.

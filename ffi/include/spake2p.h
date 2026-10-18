@@ -38,6 +38,7 @@ enum {
     SPAKE2P_ERR_CONFIRMATION_FAILED = 7,  /* wrong password/context/identity or tampering */
     SPAKE2P_ERR_RNG = 8,                  /* OS random number generator failed */
     SPAKE2P_ERR_UNKNOWN = 9,              /* an error this header does not know */
+    SPAKE2P_ERR_INVALID_RECORD = 10,      /* the stored L is not a valid point (a local fault, not the peer) */
     SPAKE2P_ERR_NULL_POINTER = 100,       /* a required pointer was NULL */
     SPAKE2P_ERR_BUFFER_TOO_SMALL = 101,   /* output capacity smaller than the output */
     SPAKE2P_ERR_PANIC = 102               /* internal panic caught (a bug) */
@@ -103,7 +104,9 @@ void spake2p_prover_free(spake2p_prover_t *prover);
 
 /* Verifier ---------------------------------------------------------------------------------- */
 
-/* Answers shareP (65). w0: 32 bytes; l: 65 bytes. Writes shareV (65) and confirmV (32) and sets
+/* Answers shareP (65). w0: 32 bytes; l: 65 bytes. A bad l of any kind (length, encoding, off-curve,
+ * identity) is SPAKE2P_ERR_INVALID_RECORD, never a peer-share error. EVERY call, whatever its
+ * outcome, consumes one password guess of the peer: count attempts here, not at finish. Writes shareV (65) and confirmV (32) and sets
  * *out_verifier (NULL on failure). */
 spake2p_status_t spake2p_verifier_respond(
     const uint8_t *context, size_t context_len,

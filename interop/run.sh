@@ -55,21 +55,30 @@ driver() { # lang role config -> runs the driver with stdin/stdout as given by t
 
 pass=0
 fail=0
-run_case() { # proverLang verifierLang mismatch n
-	dir="$OUT/run-$1-$2-$3-$4"
+run_case() { # proverLang verifierLang match|mismatch n [shape: normal|empty|long]
+	shape=${5:-normal}
+	tag="$1-$2-$3-$4"
+	[ "$shape" = normal ] || tag="$tag-$shape"
+	dir="$OUT/run-$tag"
 	mkdir -p "$dir"
-	ctx=$(hex 24)
-	idp=$(printf 'prover-%s' "$4" | od -An -tx1 | tr -d ' \n')
-	idv=$(printf 'verifier-%s' "$4" | od -An -tx1 | tr -d ' \n')
+	case $shape in
+	empty) ctx=""; idp=""; idv="" ;; # empty context and identities
+	long) ctx=$(hex 300); idp=$(hex 300); idv=$(hex 301) ;; # fields of 300 bytes or more
+	*)
+		ctx=$(hex 24)
+		idp=$(printf 'prover-%s' "$4" | od -An -tx1 | tr -d ' \n')
+		idv=$(printf 'verifier-%s' "$4" | od -An -tx1 | tr -d ' \n')
+		;;
+	esac
 	pw=$(hex 80)
-	config "$OUT/p-$1-$2-$3-$4.json" "$ctx" "$idp" "$idv" "$pw"
+	config "$OUT/p-$tag.json" "$ctx" "$idp" "$idv" "$pw"
 	if [ "$3" = mismatch ]; then pw=$(hex 80); fi
-	config "$OUT/v-$1-$2-$3-$4.json" "$ctx" "$idp" "$idv" "$pw"
+	config "$OUT/v-$tag.json" "$ctx" "$idp" "$idv" "$pw"
 	mkfifo "$dir/p2v" "$dir/v2p"
-	driver "$2" verifier "$OUT/v-$1-$2-$3-$4.json" <"$dir/p2v" >"$dir/v2p" 2>"$dir/v.err" &
+	driver "$2" verifier "$OUT/v-$tag.json" <"$dir/p2v" >"$dir/v2p" 2>"$dir/v.err" &
 	vpid=$!
 	# The prover opens its write end first: each side opening its read FIFO first would deadlock.
-	driver "$1" prover "$OUT/p-$1-$2-$3-$4.json" >"$dir/p2v" <"$dir/v2p" 2>"$dir/p.err" || true
+	driver "$1" prover "$OUT/p-$tag.json" >"$dir/p2v" <"$dir/v2p" 2>"$dir/p.err" || true
 	wait "$vpid" || true
 	p=$(tail -n1 "$dir/p.err")
 	v=$(tail -n1 "$dir/v.err")
@@ -79,14 +88,17 @@ run_case() { # proverLang verifierLang mismatch n
 		vk=$(printf '%s' "$v" | grep '"ok": *true' | sed -n 's/.*"K_shared": *"\([0-9a-f]*\)".*/\1/p')
 		if [ -n "$pk" ] && [ "$pk" = "$vk" ]; then ok=1; else ok=0; fi
 	else
-		if printf '%s' "$p" | grep -q '"ok": *false' && printf '%s' "$v" | grep -q '"ok": *false'; then ok=1; else ok=0; fi
+		# A wrong password is caught by the Prover (confirmV does not verify) and it aborts, so the
+		# Verifier sees the abort: any other pair of failures means something else went wrong.
+		if printf '%s' "$p" | grep -q '"ok": *false' && printf '%s' "$p" | grep -q '"error": *"confirmation_failed"' &&
+			printf '%s' "$v" | grep -q '"ok": *false' && printf '%s' "$v" | grep -q '"error": *"peer_aborted"'; then ok=1; else ok=0; fi
 	fi
 	if [ $ok = 1 ]; then
 		pass=$((pass + 1))
-		echo "PASS $1-prover -> $2-verifier $3 #$4"
+		echo "PASS $1-prover -> $2-verifier $3 $shape #$4"
 	else
 		fail=$((fail + 1))
-		echo "FAIL $1-prover -> $2-verifier $3 #$4"
+		echo "FAIL $1-prover -> $2-verifier $3 $shape #$4"
 		echo "  prover:   $p"
 		echo "  verifier: $v"
 	fi
@@ -100,6 +112,10 @@ for pair in "$@"; do
 	while [ $i -le "$RUNS" ]; do
 		run_case "$1" "$2" match $i
 		run_case "$1" "$2" mismatch $i
+		run_case "$1" "$2" match $i empty
+		run_case "$1" "$2" mismatch $i empty
+		run_case "$1" "$2" match $i long
+		run_case "$1" "$2" mismatch $i long
 		i=$((i + 1))
 	done
 done

@@ -20,6 +20,9 @@ public enum Spake2pError: Error, Equatable, Sendable {
     case confirmationFailed
     /// The operating system's random number generator failed.
     case rng
+    /// The stored verification value `L` is not a valid point. A local fault with the record, never
+    /// a bad peer share.
+    case invalidRecord
     /// `finish` was already called on this object. A Prover or Verifier is single-use.
     case alreadyFinished
     /// A status the Rust core reported that has no case above (an ABI mismatch or an internal bug).
@@ -35,6 +38,7 @@ public enum Spake2pError: Error, Equatable, Sendable {
         case 6: self = .zeroScalar
         case 7: self = .confirmationFailed
         case 8: self = .rng
+        case 10: self = .invalidRecord
         default: self = .unexpected(code: status)
         }
     }

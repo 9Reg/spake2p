@@ -31,10 +31,13 @@ func Example() {
 	if err != nil {
 		panic(err)
 	}
+	// Every RespondVerifier call is one password guess: count it (see the
+	// package documentation, "Rate limiting"), and always Close or Finish.
 	verifier, shareV, confirmV, err := spake2p.RespondVerifier(context, idProver, idVerifier, w0, l, shareP)
 	if err != nil {
 		panic(err)
 	}
+	defer verifier.Close()
 	confirmP, proverKey, err := prover.Finish(shareV, confirmV)
 	if err != nil {
 		panic(err)

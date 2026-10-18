@@ -76,17 +76,41 @@ shareV)`, `confirmV = HMAC(K_confirmV, shareP)`.
 - The identity element is rejected wherever a point is received or computed: X, Y, L, and also
   `Y − w0·N`, `X − w0·M`, Z and V (an all-zero share is not even encodable as uncompressed SEC1;
   the computed checks catch a peer who sends exactly w0·M or w0·N).
+- A non-canonical point encoding (wrong prefix, compressed, hybrid, coordinate >= the field prime,
+  off-curve) is `NotOnCurve` (Rust), `ErrInvalidPoint` (Go) and `invalid_point` (drivers); a wrong
+  length is `InvalidLength` / `ErrInvalidMessage`, except that drivers report a wrong-length share
+  as `invalid_point`.
+- A bad stored L is a local fault, never a peer error: `InvalidRecord` (Rust), `ErrInvalidRecord`
+  (Go), ffi status 10, driver kind `invalid_record`. A stored L is checked at load time with
+  `L::parse` (Rust) / `ParseL` (Go), and again by `respond`.
+- w0 = 0 or w1 = 0 is rejected (`ZeroScalar` / `ErrInvalidScalar`), including the zero value of the
+  Go `W0` / `W1` types.
 - Any error ends the exchange: the state object is consumed by `finish` and cannot be retried.
   A failed confirmation reveals nothing beyond "failed" (no partial keys, no distinguishing error
   text between "bad share" and "bad confirmation" at the API boundary beyond an error kind).
 
 ## Secrets
 
-- x, y, w0, w1, Z, V, K_main, K_confirmP, K_confirmV and K_shared are zeroised when the state
-  object is dropped or finished (Rust: `zeroize`; Go: overwrite byte slices, best effort, documented
-  as such since Go's GC may copy).
+- x, y, w0, w1, the encoded Z and V, K_main, K_confirmP, K_confirmV and K_shared are zeroised when
+  the state object is dropped or finished (Rust: `zeroize`; Go: overwrite byte slices, best
+  effort, since Go's GC may copy). The underlying library's point objects (`p256`, `nistec`) are
+  wiped only where the implementation holds them, best effort, not inside the library's temporaries.
+- Go: `Prover.Close()` / `Verifier.Close()` wipe and consume an exchange that will not reach
+  `Finish`; they are idempotent and `Finish` calls them itself.
+- x and y are sampled by rejection: 32 bytes from the OS CSPRNG into a wiped buffer, retried while
+  the value is >= n or zero (about 2^-32 per draw).
 - Confirmation tags are compared in constant time (Rust: `subtle` / `hmac::Mac::verify_slice`;
   Go: `crypto/hmac.Equal`).
+
+## Rate limiting
+
+SPAKE2+ lets an active attacker test exactly one password guess per run, and the library cannot
+count runs. **Every Verifier `respond` counts as one guess, whatever its outcome**: the attacker
+either receives `confirmV` and tests its guess offline, or learns from a failure that its guess was
+exactly right and never sends `confirmP`. Counting only Verifier `finish` failures gives an attacker
+unlimited guesses. Likewise **every Prover `finish` against a peer that has not yet proved itself**
+counts as one guess of that peer. The application keeps a small attempt budget per password, counts
+at `respond`, and rotates the password when the budget is spent.
 
 ## Tests every implementation carries
 
@@ -108,8 +132,9 @@ shareV)`, `confirmV = HMAC(K_confirmV, shareP)`.
 
 `interop/` holds a driver for each implementation speaking line-delimited JSON on stdin/stdout,
 one role per process. `interop/run.sh` wires Rust-Prover↔Go-Verifier and Go-Prover↔Rust-Verifier
-with random passwords and contexts, plus a mismatched-password run per pairing that must fail on
-both sides. The Swift wrapper adds its own round trip against the Rust core inside `swift test`.
+with random passwords and contexts, plus a mismatched-password run per pairing that must fail with the Prover reporting
+`confirmation_failed` and the Verifier `peer_aborted`, and cases with empty context and identities
+and with fields of 300 bytes or more. The Swift wrapper adds its own round trip against the Rust core inside `swift test`.
 
 Driver contract (both languages identical; all byte values lowercase hex):
 
@@ -121,6 +146,11 @@ Driver contract (both languages identical; all byte values lowercase hex):
   Prover → `{"shareP": hex}`; Verifier → `{"shareV": hex, "confirmV": hex}`;
   Prover → `{"confirmP": hex}` (or `{"abort": true}` if confirmV failed, then exits).
 - The outcome is one JSON line on stderr: `{"ok": true, "K_shared": hex}` or
-  `{"ok": false, "error": "<kind>"}`. Exit code 0 on ok, 1 on protocol failure, 2 on bad usage.
+  `{"ok": false, "error": "<kind>"}`. `<kind>` is one of `confirmation_failed`, `peer_aborted`,
+  `invalid_point`, `invalid_record`, `io`, `invalid_message`, `invalid_scalar`,
+  `invalid_pbkdf_output`, `finished`, `invalid_state`, `random`. Not every driver can reach every
+  kind: `finished` and `invalid_state` exist only in Go (Rust and Swift consume the state by
+  construction), and the Rust and Swift drivers report a wrong-length `pbkdf_output` as
+  `invalid_message`. Exit code 0 on ok, 1 on protocol failure, 2 on bad usage.
 - `interop/run.sh` connects two drivers with two FIFOs, and passes when both report ok with equal
   K_shared (matching password) or both report not ok (mismatched password).

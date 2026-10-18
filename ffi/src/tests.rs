@@ -471,3 +471,30 @@ fn pbkdf_input_matches_core() {
 fn panic_becomes_status() {
     assert_eq!(guard(|| panic!("boom")), SPAKE2P_ERR_PANIC);
 }
+
+#[test]
+fn bad_stored_l_is_invalid_record_not_a_peer_error() {
+    let k = keys(7);
+    let (p, share_p) = start(CTX, &k);
+    let mut bad_l = Keys {
+        w0: k.w0,
+        w1: k.w1,
+        l: k.l,
+    };
+    for mutate in 0..4 {
+        bad_l.l = k.l;
+        match mutate {
+            0 => bad_l.l[64] ^= 1,    // off curve
+            1 => bad_l.l[0] = 0x02,   // not uncompressed
+            2 => bad_l.l = [0u8; 65], // zero
+            _ => bad_l.l[1] ^= 0x80,  // another coordinate
+        }
+        let (rc, v, _, _) = respond(CTX, &bad_l, &share_p);
+        assert_eq!(rc, SPAKE2P_ERR_INVALID_RECORD, "mutation {mutate}");
+        assert!(v.is_null());
+    }
+    assert_eq!(SPAKE2P_ERR_INVALID_RECORD, 10);
+    assert_eq!(SPAKE2P_ERR_UNKNOWN, 9);
+    assert_eq!(SPAKE2P_ERR_NULL_POINTER, 100);
+    unsafe { spake2p_prover_free(p) };
+}

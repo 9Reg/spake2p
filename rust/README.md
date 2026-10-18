@@ -19,7 +19,7 @@ use spake2p::{register, w0w1_from_pbkdf_output, Prover, Verifier};
 // `spake2p::pbkdf_input(password, id_prover, id_verifier)`.
 let pbkdf_output = [0x42u8; 80];
 let (w0, w1) = w0w1_from_pbkdf_output(&pbkdf_output)?;
-let l = register(&w1); // the Verifier stores (w0, l), never w1
+let l = register(&w1)?; // the Verifier stores (w0, l), never w1
 
 let (ctx, idp, idv) = (b"my-app v1".as_slice(), b"client".as_slice(), b"server".as_slice());
 
@@ -37,11 +37,16 @@ assert_eq!(prover_key.as_bytes(), verifier_key.as_bytes());
   and identity points are rejected, as are computed identities (`Y - w0·N`, `X - w0·M`, `Z`, `V`).
 - `finish` consumes the state: a failed exchange cannot be retried. A failed confirmation returns
   one error and no key material. Tags are compared in constant time.
-- Secrets (`x`, `y`, `w0`, `w1`, `Z`, `V`, derived keys) are zeroised on drop, on a best-effort
-  basis; the compiler or OS may have copied them.
+- Secrets (`x`, `y`, `w0`, `w1`, the encoded `Z` and `V`, derived keys) are zeroised on drop, on a
+  best-effort basis (the `p256` point objects only where this crate holds them); the compiler or OS may have copied them.
 - Randomness comes from the operating system's CSPRNG (`getrandom`).
-- An active attacker gets one password guess per run: rate-limit attempts and use a memory-hard
-  PBKDF. Use non-empty prover and verifier identities, as RFC 9383 recommends.
+- An active attacker gets one password guess per run, and **every `Verifier::respond` call counts
+  as one guess whatever its outcome** (the attacker either receives `confirmV` to test offline, or
+  learns from a failure that its guess was right and never sends `confirmP`). Counting only
+  `Verifier::finish` failures gives unlimited guesses. The same holds for `Prover::finish` against
+  a peer that has not proved itself. Keep a small attempt budget per password, count at `respond`,
+  and use a memory-hard PBKDF. Use non-empty prover and verifier identities, as RFC 9383
+  recommends. See "Rate limiting" in `SPEC.md`.
 - This crate has not had an independent audit. It reproduces the RFC 9383 test vector byte for
   byte.
 

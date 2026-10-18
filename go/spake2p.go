@@ -30,29 +30,63 @@
 // no error. Both Finish methods are single use: whatever the outcome, the state
 // is consumed and a second call returns [ErrFinished].
 //
+// # Rate limiting
+//
+// A password is only as strong as the number of guesses an attacker gets, and
+// this library cannot count them for you. Every call to [RespondVerifier],
+// whatever its outcome, consumes one guess: the attacker learns confirmV from
+// it (and can test its guess offline) or learns from a failure that its guess
+// was exactly right, and then simply never sends confirmP. Counting only
+// [Verifier.Finish] failures therefore gives an attacker unlimited guesses.
+// Likewise every [Prover.Finish] against a peer that has not yet proved itself
+// consumes one guess of that peer. The application must keep a small budget of
+// attempts per password, count them at RespondVerifier, and rotate the
+// password when the budget is spent.
+//
+// # Types
+//
+// Values that must not be mixed up have distinct types: [W0] and [W1] (the
+// password-derived scalars), [L] (the stored verification value), and
+// [ShareP], [ShareV], [ConfirmP], [ConfirmV] (peer messages, named byte
+// slices). Swapping two of them does not compile. Parse stored values with
+// [ParseW0], [ParseW1] and [ParseL] when you load them, so that a corrupted
+// record is found before a peer connects; [ErrInvalidRecord] then means a
+// local fault, never a bad peer. W0, W1 and L also implement
+// encoding.BinaryMarshaler/BinaryUnmarshaler and json.Marshaler/Unmarshaler
+// (hex), all going through the same parsers, so a stored struct can never
+// silently decode to a zero value that passes as a valid secret.
+//
 // # Wire format
 //
 // Shares and L are SEC1 uncompressed points: exactly 65 bytes, first byte 0x04.
-// Compressed, hybrid, short, long, off-curve and identity encodings are all
-// rejected. Scalars are 32 bytes, big-endian, in [1, n-1] where n is the P-256
-// group order. Confirmation messages and the shared key are 32 bytes.
+// Compressed, hybrid, short, long, off-curve, non-canonical and identity
+// encodings are all rejected. Scalars are 32 bytes, big-endian, in [1, n-1]
+// where n is the P-256 group order. Confirmation messages and the shared key
+// are 32 bytes.
 //
 // # Secrets in memory
 //
 // Secret byte slices (x, y, w0, w1, Z, V, K_main, K_confirmP, K_confirmV and
 // the shared key held internally) are overwritten with zeros once they are no
-// longer needed. This is best effort only: Go's garbage collector may have
-// copied them before, and the runtime gives no way to prevent that. The shared
-// key returned to the caller is the caller's to protect and wipe.
+// longer needed: by Finish, or by Close for a state that is abandoned. Always
+// reach one of them, for example with defer v.Close() right after
+// [RespondVerifier] succeeds. This is best effort only: Go's garbage collector
+// may have copied them before, and the runtime gives no way to prevent that;
+// the elliptic-curve point objects of the underlying library are not wiped.
+// The shared key returned to the caller is the caller's to protect and wipe.
 package spake2p
 
 import (
+	"bytes"
 	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
+	"sync"
 
 	"filippo.io/bigmod"
 	"filippo.io/nistec"
@@ -75,22 +109,31 @@ const (
 
 // Sentinel errors. Test with [errors.Is]. None of them carries secret data.
 var (
-	// ErrInvalidScalar means a scalar was not 32 bytes, was zero, or was not
-	// below the P-256 group order. Such values are never silently reduced.
+	// ErrInvalidScalar means a scalar was not 32 bytes, was zero (including a
+	// zero-value or wiped [W0]/[W1]), or was not below the P-256 group order.
+	// Such values are never silently reduced.
 	ErrInvalidScalar = errors.New("spake2p: invalid scalar")
 	// ErrInvalidPBKDFOutput means the PBKDF output was not exactly 80 bytes,
 	// or one of the two scalars derived from it was zero.
 	ErrInvalidPBKDFOutput = errors.New("spake2p: invalid PBKDF output")
-	// ErrInvalidPoint means a received share or L was not a valid 65-byte
-	// uncompressed P-256 point, or a point computed from it was the identity.
+	// ErrInvalidPoint means a received share was not a valid 65-byte
+	// uncompressed P-256 point (including a non-canonical coordinate), or a
+	// point computed from it was the identity. It is about the peer.
 	ErrInvalidPoint = errors.New("spake2p: invalid point")
+	// ErrInvalidRecord means the locally stored verification value L was not a
+	// valid 65-byte uncompressed P-256 point (or was nil or zero-value). It is a
+	// local fault, never the peer's.
+	ErrInvalidRecord = errors.New("spake2p: invalid record")
 	// ErrInvalidMessage means a confirmation message had the wrong length.
 	ErrInvalidMessage = errors.New("spake2p: invalid message length")
 	// ErrConfirmationFailed means a confirmation tag did not verify: the peer
 	// used a different password, context or identity, or a message was altered.
 	ErrConfirmationFailed = errors.New("spake2p: confirmation failed")
-	// ErrFinished means Finish was already called on this state object.
+	// ErrFinished means Finish or Close was already called on this state object.
 	ErrFinished = errors.New("spake2p: already finished")
+	// ErrInvalidState means the state object is a zero value, not one returned
+	// by [StartProver] or [RespondVerifier].
+	ErrInvalidState = errors.New("spake2p: invalid state")
 	// ErrRandom means the operating system's random number generator failed.
 	ErrRandom = errors.New("spake2p: random source failed")
 )
@@ -161,39 +204,246 @@ func mustPoint(compressedHex string) *nistec.P256Point {
 	return p
 }
 
-// Scalar is an integer in [1, n-1], n the P-256 group order: a password-derived
-// value w0 or w1. Obtain one from [ParseScalar] or [W0W1FromPBKDFOutput]. The
-// zero Scalar is invalid.
-type Scalar struct {
+// isZero reports whether b is all zero bytes, without branching on its value.
+func isZero(b []byte) bool {
+	var acc byte
+	for _, c := range b {
+		acc |= c
+	}
+	return subtle.ConstantTimeByteEq(acc, 0) == 1
+}
+
+// checkScalar validates a 32-byte scalar: in [1, n-1].
+func checkScalar(b []byte) error {
+	if len(b) != ScalarSize {
+		return ErrInvalidScalar
+	}
+	n, err := bigmod.NewNat().SetBytes(b, orderMod)
+	if err != nil || n.IsZero() == 1 || isZero(b) {
+		return ErrInvalidScalar
+	}
+	return nil
+}
+
+func marshalHex(b []byte) []byte {
+	out := make([]byte, hex.EncodedLen(len(b)))
+	hex.Encode(out, b)
+	return out
+}
+
+func unmarshalHexJSON(data []byte) ([]byte, error) {
+	if len(data) < 2 || data[0] != '"' || data[len(data)-1] != '"' {
+		return nil, errors.New("spake2p: JSON value must be a hex string")
+	}
+	return hex.DecodeString(string(data[1 : len(data)-1]))
+}
+
+// W0 is the password-derived scalar w0, an integer in [1, n-1], n the P-256
+// group order. Obtain one from [ParseW0] or [W0W1FromPBKDFOutput]. The zero W0
+// is invalid and is rejected by [StartProver], [RespondVerifier].
+type W0 struct {
 	b [ScalarSize]byte
 }
 
-// ParseScalar reads a 32-byte big-endian scalar. It returns [ErrInvalidScalar]
-// if b is not exactly 32 bytes, is zero, or is greater than or equal to the
-// group order. A value at or above the order is an error, never reduced.
-func ParseScalar(b []byte) (*Scalar, error) {
-	if len(b) != ScalarSize {
-		return nil, ErrInvalidScalar
+// W1 is the password-derived scalar w1, an integer in [1, n-1]. Obtain one from
+// [ParseW1] or [W0W1FromPBKDFOutput]. The zero W1 is invalid and is rejected by
+// [StartProver] and [Register].
+type W1 struct {
+	b [ScalarSize]byte
+}
+
+// ParseW0 reads a 32-byte big-endian w0. It returns [ErrInvalidScalar] if b is
+// not exactly 32 bytes, is zero, or is greater than or equal to the group
+// order. A value at or above the order is an error, never reduced.
+func ParseW0(b []byte) (*W0, error) {
+	if err := checkScalar(b); err != nil {
+		return nil, err
 	}
-	n, err := bigmod.NewNat().SetBytes(b, orderMod)
-	if err != nil || n.IsZero() == 1 {
-		return nil, ErrInvalidScalar
-	}
-	s := new(Scalar)
+	s := new(W0)
 	copy(s.b[:], b)
 	return s, nil
 }
 
-// Bytes returns a copy of the 32-byte big-endian encoding of s.
-func (s *Scalar) Bytes() []byte {
-	out := make([]byte, ScalarSize)
-	copy(out, s.b[:])
-	return out
+// ParseW1 is [ParseW0] for w1.
+func ParseW1(b []byte) (*W1, error) {
+	if err := checkScalar(b); err != nil {
+		return nil, err
+	}
+	s := new(W1)
+	copy(s.b[:], b)
+	return s, nil
 }
 
+// valid reports whether s is non-nil and a scalar in [1, n-1].
+func (s *W0) valid() bool { return s != nil && checkScalar(s.b[:]) == nil }
+func (s *W1) valid() bool { return s != nil && checkScalar(s.b[:]) == nil }
+
+// Bytes returns a copy of the 32-byte big-endian encoding of s.
+func (s *W0) Bytes() []byte { return bytes.Clone(s.b[:]) }
+
+// Bytes returns a copy of the 32-byte big-endian encoding of s.
+func (s *W1) Bytes() []byte { return bytes.Clone(s.b[:]) }
+
 // Zero overwrites s with zeros (best effort, see the package documentation).
-// The Scalar is unusable afterwards.
-func (s *Scalar) Zero() { wipe(s.b[:]) }
+// The all-zero value is invalid, so every entry point rejects s afterwards
+// with [ErrInvalidScalar].
+func (s *W0) Zero() { wipe(s.b[:]) }
+
+// Zero overwrites s with zeros; see [W0.Zero].
+func (s *W1) Zero() { wipe(s.b[:]) }
+
+// MarshalBinary returns the 32-byte encoding. It fails for an invalid (zero)
+// value.
+func (s W0) MarshalBinary() ([]byte, error) {
+	if checkScalar(s.b[:]) != nil {
+		return nil, ErrInvalidScalar
+	}
+	return bytes.Clone(s.b[:]), nil
+}
+
+// UnmarshalBinary parses like [ParseW0]; on error s is left unchanged.
+func (s *W0) UnmarshalBinary(data []byte) error {
+	p, err := ParseW0(data)
+	if err != nil {
+		return err
+	}
+	*s = *p
+	p.Zero()
+	return nil
+}
+
+// MarshalJSON encodes s as a hex string.
+func (s W0) MarshalJSON() ([]byte, error) {
+	b, err := s.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	defer wipe(b)
+	return append(append([]byte{'"'}, marshalHex(b)...), '"'), nil
+}
+
+// UnmarshalJSON decodes a hex string through [ParseW0].
+func (s *W0) UnmarshalJSON(data []byte) error {
+	b, err := unmarshalHexJSON(data)
+	if err != nil {
+		return ErrInvalidScalar
+	}
+	defer wipe(b)
+	return s.UnmarshalBinary(b)
+}
+
+// MarshalBinary returns the 32-byte encoding. It fails for an invalid (zero)
+// value.
+func (s W1) MarshalBinary() ([]byte, error) {
+	if checkScalar(s.b[:]) != nil {
+		return nil, ErrInvalidScalar
+	}
+	return bytes.Clone(s.b[:]), nil
+}
+
+// UnmarshalBinary parses like [ParseW1]; on error s is left unchanged.
+func (s *W1) UnmarshalBinary(data []byte) error {
+	p, err := ParseW1(data)
+	if err != nil {
+		return err
+	}
+	*s = *p
+	p.Zero()
+	return nil
+}
+
+// MarshalJSON encodes s as a hex string.
+func (s W1) MarshalJSON() ([]byte, error) {
+	b, err := s.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	defer wipe(b)
+	return append(append([]byte{'"'}, marshalHex(b)...), '"'), nil
+}
+
+// UnmarshalJSON decodes a hex string through [ParseW1].
+func (s *W1) UnmarshalJSON(data []byte) error {
+	b, err := unmarshalHexJSON(data)
+	if err != nil {
+		return ErrInvalidScalar
+	}
+	defer wipe(b)
+	return s.UnmarshalBinary(b)
+}
+
+// L is the Verifier's stored verification value L = w1·P: a valid, non-identity
+// P-256 point. Obtain one from [Register] or [ParseL]. The zero L is invalid and
+// is rejected by [RespondVerifier] with [ErrInvalidRecord].
+type L struct {
+	b [PointSize]byte
+}
+
+// ParseL validates a stored L: exactly 65 bytes, SEC1 uncompressed, canonical,
+// on the curve, not the identity. Call it when loading a record, so that a
+// corrupted record is found before any peer connects. It returns
+// [ErrInvalidRecord] on failure.
+func ParseL(b []byte) (*L, error) {
+	if _, err := decodePoint(b); err != nil {
+		return nil, ErrInvalidRecord
+	}
+	l := new(L)
+	copy(l.b[:], b)
+	return l, nil
+}
+
+// Bytes returns a copy of the 65-byte encoding of l.
+func (l *L) Bytes() []byte { return bytes.Clone(l.b[:]) }
+
+// MarshalBinary returns the 65-byte encoding. It fails for an invalid value.
+func (l L) MarshalBinary() ([]byte, error) {
+	if _, err := decodePoint(l.b[:]); err != nil {
+		return nil, ErrInvalidRecord
+	}
+	return bytes.Clone(l.b[:]), nil
+}
+
+// UnmarshalBinary parses like [ParseL]; on error l is left unchanged.
+func (l *L) UnmarshalBinary(data []byte) error {
+	p, err := ParseL(data)
+	if err != nil {
+		return err
+	}
+	*l = *p
+	return nil
+}
+
+// MarshalJSON encodes l as a hex string.
+func (l L) MarshalJSON() ([]byte, error) {
+	b, err := l.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	return append(append([]byte{'"'}, marshalHex(b)...), '"'), nil
+}
+
+// UnmarshalJSON decodes a hex string through [ParseL].
+func (l *L) UnmarshalJSON(data []byte) error {
+	b, err := unmarshalHexJSON(data)
+	if err != nil {
+		return ErrInvalidRecord
+	}
+	return l.UnmarshalBinary(b)
+}
+
+// The messages exchanged with the peer, as distinct types so that two of them
+// cannot be swapped. They are plain byte slices: convert with ShareP(b) when
+// reading from the network.
+type (
+	// ShareP is the Prover's share X, 65 bytes.
+	ShareP []byte
+	// ShareV is the Verifier's share Y, 65 bytes.
+	ShareV []byte
+	// ConfirmP is the Prover's confirmation tag, 32 bytes.
+	ConfirmP []byte
+	// ConfirmV is the Verifier's confirmation tag, 32 bytes.
+	ConfirmV []byte
+)
 
 // reduce40 reads a 40-byte big-endian integer and reduces it mod n.
 // Constant time in the value (bigmod).
@@ -212,7 +462,7 @@ func reduce40(b []byte) []byte {
 // about 2^-256 for a PBKDF).
 //
 // The PBKDF itself is the application's choice and out of scope here.
-func W0W1FromPBKDFOutput(out []byte) (w0, w1 *Scalar, err error) {
+func W0W1FromPBKDFOutput(out []byte) (w0 *W0, w1 *W1, err error) {
 	if len(out) != PBKDFOutputSize {
 		return nil, nil, ErrInvalidPBKDFOutput
 	}
@@ -220,8 +470,8 @@ func W0W1FromPBKDFOutput(out []byte) (w0, w1 *Scalar, err error) {
 	w1b := reduce40(out[40:])
 	defer wipe(w0b)
 	defer wipe(w1b)
-	w0, err0 := ParseScalar(w0b)
-	w1, err1 := ParseScalar(w1b)
+	w0, err0 := ParseW0(w0b)
+	w1, err1 := ParseW1(w1b)
 	if err0 != nil || err1 != nil {
 		return nil, nil, ErrInvalidPBKDFOutput
 	}
@@ -239,16 +489,19 @@ func PBKDFInput(pw, idProver, idVerifier []byte) []byte {
 }
 
 // Register computes L = w1·P, the Verifier's verification value, as a 65-byte
-// uncompressed point. The Verifier stores (w0, L) and never w1.
-func Register(w1 *Scalar) ([]byte, error) {
-	if w1 == nil {
+// uncompressed point, as an [L]. It returns [ErrInvalidScalar] for a nil, zero or
+// wiped w1. The Verifier stores (w0, L) and never w1.
+func Register(w1 *W1) (*L, error) {
+	if !w1.valid() {
 		return nil, ErrInvalidScalar
 	}
-	l, err := nistec.NewP256Point().ScalarBaseMult(w1.b[:])
-	if err != nil || isIdentity(l) {
+	p, err := nistec.NewP256Point().ScalarBaseMult(w1.b[:])
+	if err != nil || isIdentity(p) {
 		return nil, ErrInvalidScalar
 	}
-	return l.Bytes(), nil
+	l := new(L)
+	copy(l.b[:], p.Bytes())
+	return l, nil
 }
 
 // ---- helpers ----
@@ -279,9 +532,9 @@ func decodePoint(b []byte) (*nistec.P256Point, error) {
 	return p, nil
 }
 
-// randomScalar returns a uniform value in [0, n-1] by rejection sampling: it
+// randomScalar returns a uniform value in [1, n-1] by rejection sampling: it
 // draws 32 random bytes and retries while the value is >= n (probability about
-// 2^-32 per draw). Rejection leaks nothing about the accepted value.
+// 2^-32 per draw) or zero. Rejection leaks nothing about the accepted value.
 func randomScalar() ([]byte, error) {
 	buf := make([]byte, ScalarSize)
 	for {
@@ -289,7 +542,7 @@ func randomScalar() ([]byte, error) {
 			wipe(buf)
 			return nil, ErrRandom
 		}
-		if _, err := bigmod.NewNat().SetBytes(buf, orderMod); err == nil {
+		if n, err := bigmod.NewNat().SetBytes(buf, orderMod); err == nil && n.IsZero() == 0 {
 			return buf, nil
 		}
 	}
@@ -385,8 +638,11 @@ func mac(key, msg []byte) []byte {
 
 // ---- Prover ----
 
-// Prover is the Prover's state between [StartProver] and [Prover.Finish].
+// Prover is the Prover's state between [StartProver] and [Prover.Finish]. It is
+// safe to call Finish and Close from several goroutines; exactly one Finish
+// succeeds.
 type Prover struct {
+	mu                            sync.Mutex
 	context, idProver, idVerifier []byte
 	x, w0, w1                     []byte
 	shareP                        []byte
@@ -394,10 +650,12 @@ type Prover struct {
 }
 
 // StartProver begins an exchange as the Prover. It draws x uniformly from
-// [0, n-1] using crypto/rand and returns shareP = x·P + w0·M, 65 bytes, to
+// [1, n-1] using crypto/rand and returns shareP = x·P + w0·M, 65 bytes, to
 // send to the Verifier. context, idProver and idVerifier must be identical on
-// both sides; any of them may be empty. The scalars are copied.
-func StartProver(context, idProver, idVerifier []byte, w0, w1 *Scalar) (*Prover, []byte, error) {
+// both sides; any of them may be empty. The scalars are copied. A nil, zero or
+// wiped w0 or w1 returns [ErrInvalidScalar]. Always reach [Prover.Finish] or
+// [Prover.Close].
+func StartProver(context, idProver, idVerifier []byte, w0 *W0, w1 *W1) (*Prover, ShareP, error) {
 	x, err := randomScalar()
 	if err != nil {
 		return nil, nil, err
@@ -407,8 +665,8 @@ func StartProver(context, idProver, idVerifier []byte, w0, w1 *Scalar) (*Prover,
 
 // startProver is StartProver with x injected (test hook). It takes ownership
 // of x.
-func startProver(context, idProver, idVerifier []byte, w0, w1 *Scalar, x []byte) (*Prover, []byte, error) {
-	if w0 == nil || w1 == nil || len(x) != ScalarSize {
+func startProver(context, idProver, idVerifier []byte, w0 *W0, w1 *W1, x []byte) (*Prover, ShareP, error) {
+	if !w0.valid() || !w1.valid() || len(x) != ScalarSize {
 		wipe(x)
 		return nil, nil, ErrInvalidScalar
 	}
@@ -426,10 +684,21 @@ func startProver(context, idProver, idVerifier []byte, w0, w1 *Scalar, x []byte)
 		w1:         w1.Bytes(),
 		shareP:     shareP,
 	}
-	return p, append([]byte(nil), shareP...), nil
+	return p, append(ShareP(nil), shareP...), nil
 }
 
-func (p *Prover) wipe() {
+// Close wipes every secret the Prover holds and consumes it: a later Finish
+// returns [ErrFinished]. It is idempotent and safe for concurrent use. Use it
+// as defer p.Close() so that an abandoned exchange does not leave x, w0 and w1
+// behind; [Prover.Finish] calls it itself.
+func (p *Prover) Close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closeLocked()
+}
+
+func (p *Prover) closeLocked() {
+	p.finished = true
 	wipe(p.x)
 	wipe(p.w0)
 	wipe(p.w1)
@@ -439,26 +708,31 @@ func (p *Prover) wipe() {
 // checks confirmV in constant time. Only if confirmV is correct does it return
 // confirmP (send it to the Verifier) and the 32-byte shared key; otherwise it
 // returns an error and nothing else. Errors: [ErrInvalidPoint],
-// [ErrInvalidMessage], [ErrConfirmationFailed], [ErrFinished]. Finish may be
-// called once; the state is consumed whatever the outcome.
-func (p *Prover) Finish(shareV, confirmV []byte) (confirmP, kShared []byte, err error) {
+// [ErrInvalidMessage], [ErrConfirmationFailed], [ErrFinished],
+// [ErrInvalidState] (a zero-value Prover). Finish may be called once, also
+// across goroutines; the state is consumed whatever the outcome.
+func (p *Prover) Finish(shareV ShareV, confirmV ConfirmV) (confirmP ConfirmP, kShared []byte, err error) {
 	t, err := p.finish(shareV, confirmV)
 	if err != nil {
 		return nil, nil, err
 	}
-	confirmP = t.confirmP
+	confirmP = append(ConfirmP(nil), t.confirmP...)
 	kShared = append([]byte(nil), t.kShared...)
 	t.wipe()
 	return confirmP, kShared, nil
 }
 
 // finish returns the full trace on success; the caller wipes it.
-func (p *Prover) finish(shareV, confirmV []byte) (*trace, error) {
+func (p *Prover) finish(shareV ShareV, confirmV ConfirmV) (*trace, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.finished {
 		return nil, ErrFinished
 	}
-	p.finished = true
-	defer p.wipe()
+	if len(p.x) != ScalarSize || len(p.w0) != ScalarSize || len(p.w1) != ScalarSize {
+		return nil, ErrInvalidState
+	}
+	defer p.closeLocked()
 
 	y, err := decodePoint(shareV)
 	if err != nil {
@@ -494,18 +768,25 @@ func (p *Prover) finish(shareV, confirmV []byte) (*trace, error) {
 // ---- Verifier ----
 
 // Verifier is the Verifier's state between [RespondVerifier] and
-// [Verifier.Finish].
+// [Verifier.Finish]. It is safe to call Finish and Close from several
+// goroutines; exactly one Finish succeeds.
 type Verifier struct {
+	mu       sync.Mutex
 	t        *trace
 	finished bool
 }
 
 // RespondVerifier handles shareP as the Verifier. w0 and l are the stored
-// verification record (l as returned by [Register]). It validates shareP and
-// l, draws y uniformly from [0, n-1] using crypto/rand, and returns
+// verification record (l as returned by [Register] or [ParseL]). It validates
+// shareP, draws y uniformly from [1, n-1] using crypto/rand, and returns
 // shareV = y·P + w0·N and confirmV, both to send to the Prover. Errors:
-// [ErrInvalidPoint], [ErrInvalidScalar], [ErrRandom].
-func RespondVerifier(context, idProver, idVerifier []byte, w0 *Scalar, l, shareP []byte) (*Verifier, []byte, []byte, error) {
+// [ErrInvalidPoint] (a bad shareP), [ErrInvalidRecord] (a bad l, a local
+// fault), [ErrInvalidScalar] (a nil, zero or wiped w0), [ErrRandom].
+//
+// Every call consumes one password guess of the peer, whatever its outcome;
+// see "Rate limiting" in the package documentation. Always reach
+// [Verifier.Finish] or [Verifier.Close] on the returned Verifier.
+func RespondVerifier(context, idProver, idVerifier []byte, w0 *W0, l *L, shareP ShareP) (*Verifier, ShareV, ConfirmV, error) {
 	y, err := randomScalar()
 	if err != nil {
 		return nil, nil, nil, err
@@ -515,16 +796,19 @@ func RespondVerifier(context, idProver, idVerifier []byte, w0 *Scalar, l, shareP
 
 // respondVerifier is RespondVerifier with y injected (test hook). It takes
 // ownership of y.
-func respondVerifier(context, idProver, idVerifier []byte, w0 *Scalar, l, shareP, y []byte) (*Verifier, []byte, []byte, error) {
+func respondVerifier(context, idProver, idVerifier []byte, w0 *W0, l *L, shareP ShareP, y []byte) (*Verifier, ShareV, ConfirmV, error) {
 	defer wipe(y)
-	if w0 == nil || len(y) != ScalarSize {
+	if !w0.valid() || len(y) != ScalarSize {
 		return nil, nil, nil, ErrInvalidScalar
 	}
-	x, err := decodePoint(shareP)
-	if err != nil {
-		return nil, nil, nil, err
+	if l == nil {
+		return nil, nil, nil, ErrInvalidRecord
 	}
-	lp, err := decodePoint(l)
+	lp, err := decodePoint(l.b[:])
+	if err != nil {
+		return nil, nil, nil, ErrInvalidRecord
+	}
+	x, err := decodePoint(shareP)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -549,19 +833,41 @@ func respondVerifier(context, idProver, idVerifier []byte, w0 *Scalar, l, shareP
 		t.wipe()
 		return nil, nil, nil, err
 	}
-	return &Verifier{t: t}, append([]byte(nil), shareV...), append([]byte(nil), t.confirmV...), nil
+	return &Verifier{t: t}, append(ShareV(nil), shareV...), append(ConfirmV(nil), t.confirmV...), nil
+}
+
+// Close wipes every secret the Verifier holds and consumes it: a later Finish
+// returns [ErrFinished]. It is idempotent and safe for concurrent use. Use it
+// as defer v.Close() right after [RespondVerifier] succeeds, so that an
+// abandoned exchange (the usual shape of a guessing attacker) does not leave
+// the keys and the transcript behind; [Verifier.Finish] calls it itself.
+func (v *Verifier) Close() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.closeLocked()
+}
+
+func (v *Verifier) closeLocked() {
+	v.finished = true
+	if v.t != nil {
+		v.t.wipe()
+	}
 }
 
 // Finish checks confirmP in constant time and, only if it is correct, returns
 // the 32-byte shared key. Errors: [ErrInvalidMessage], [ErrConfirmationFailed],
-// [ErrFinished]. Finish may be called once; the state is consumed whatever the
-// outcome.
-func (v *Verifier) Finish(confirmP []byte) (kShared []byte, err error) {
+// [ErrFinished], [ErrInvalidState] (a zero-value Verifier). Finish may be called
+// once, also across goroutines; the state is consumed whatever the outcome.
+func (v *Verifier) Finish(confirmP ConfirmP) (kShared []byte, err error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	if v.finished {
 		return nil, ErrFinished
 	}
-	v.finished = true
-	defer v.t.wipe()
+	if v.t == nil {
+		return nil, ErrInvalidState
+	}
+	defer v.closeLocked()
 	if len(confirmP) != ConfirmSize {
 		return nil, ErrInvalidMessage
 	}
