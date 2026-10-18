@@ -1,0 +1,25 @@
+[package]
+name = "spake2p"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/9Reg/spake2p"
+description = "RFC 9383 SPAKE2+ (P256-SHA256-HKDF-SHA256-HMAC-SHA256) password-authenticated key exchange"
+keywords = ["spake2plus", "pake", "rfc9383", "pairing", "p256"]
+categories = ["cryptography"]
+readme = "README.md"
+include = ["src/**", "vectors/**", "examples/**", "README.md", "LICENSE-APACHE", "LICENSE-MIT", "Cargo.toml"]
+
+[dependencies]
+p256 = { version = "0.14", default-features = false, features = ["arithmetic"] }
+sha2 = "0.11"
+hmac = "0.13"
+hkdf = "0.13"
+subtle = "2.6"
+zeroize = { version = "1.9", features = ["derive"] }
+getrandom = { version = "0.4", features = ["sys_rng"] }
+rand_core = "0.10"
+
+[dev-dependencies]
+serde_json = "1"
