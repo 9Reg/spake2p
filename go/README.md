@@ -41,8 +41,9 @@ exchange does not leave secrets behind. `Finish` calls it itself.
 
 ## Security notes
 
-- The PBKDF that turns a password into the 80 bytes is yours to choose (use a memory-hard one such as
-  scrypt or Argon2id). SPAKE2+ limits an attacker to one guess per run; it does not make a weak
+- The PBKDF that turns a password into the 80 bytes is yours to choose (a slow one such as scrypt or
+  Argon2id matters only when the verifier record is persisted and the password is low-entropy; for a
+  short-lived record from a short code, the attempt budget is the defence). SPAKE2+ limits an attacker to one guess per run; it does not make a weak
   password strong.
 - **Every `RespondVerifier` call counts as one guess, whatever its outcome**: the attacker either
   receives `confirmV` to test offline, or learns from a failure that its guess was right and never

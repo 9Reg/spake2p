@@ -10,6 +10,9 @@
  *    stated below; only the leading bytes are written.
  *  - Sizes: scalar (w0, w1) 32, point (shareP, shareV, L) 65 (uncompressed SEC1), confirmation tag 32,
  *    shared key 32, PBKDF output 80.
+ *  - Output buffers must not overlap an input or each other.
+ *  - The one exception to "no output on error": spake2p_pbkdf_input writes *out_len on
+ *    SPAKE2P_ERR_BUFFER_TOO_SMALL. It also accepts out == NULL when out_cap == 0 (the size probe).
  *  - Handles are not thread-safe: use one from one thread at a time (moving between threads is fine).
  *  - spake2p_*_finish CONSUMES its handle on success and on failure: it is freed (and zeroised) and the
  *    pointer is invalid afterwards. Do not call finish twice or free a finished handle.
@@ -20,6 +23,10 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+/* Version of this ABI; bumped on any incompatible change. spake2p_abi_version() returns the version
+ * the library was built with: refuse to run if it differs from this value. */
+#define SPAKE2P_ABI_VERSION 1u
 
 #ifdef __cplusplus
 extern "C" {
@@ -71,7 +78,7 @@ spake2p_status_t spake2p_register(
 
 /* RFC 9383 section 3.2 PBKDF input. Required size = 24 + password_len + id_prover_len +
  * id_verifier_len; *out_len (non-NULL) receives it on success and on BUFFER_TOO_SMALL, so a caller can
- * probe with out_cap = 0 and any non-NULL out. */
+ * probe with out_cap = 0 (out may be NULL then). */
 spake2p_status_t spake2p_pbkdf_input(
     const uint8_t *password, size_t password_len,
     const uint8_t *id_prover, size_t id_prover_len,
@@ -128,6 +135,13 @@ spake2p_status_t spake2p_verifier_finish(
 
 /* Frees (and zeroises) a Verifier that was never finished. NULL is a no-op. */
 void spake2p_verifier_free(spake2p_verifier_t *verifier);
+
+/* Checks a stored L (65 bytes): SPAKE2P_OK if it is a valid uncompressed, on-curve, non-identity point,
+ * SPAKE2P_ERR_INVALID_RECORD for any defect (length included). NULL l only with l_len 0 (invalid). */
+spake2p_status_t spake2p_l_validate(const uint8_t *l, size_t l_len);
+
+/* The ABI version the library was built with (compare with SPAKE2P_ABI_VERSION). */
+uint32_t spake2p_abi_version(void);
 
 /* The PBKDF output length spake2p_w0w1_from_pbkdf_output requires (80). */
 size_t spake2p_pbkdf_output_len(void);

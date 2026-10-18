@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 import Testing
 
+import CSpake2p
 @testable import Spake2p
 
 private let ctx = Data("swift test".utf8)
@@ -9,11 +10,12 @@ private let idP = Data("client".utf8)
 private let idV = Data("server".utf8)
 
 private struct Registered {
-    let w0: Data, w1: Data, l: Data
+    let w0: W0, w1: W1, l: L
     init(seed: UInt8) throws {
         (w0, w1) = try Spake2p.w0w1(fromPBKDFOutput: Data(repeating: seed, count: 80))
         l = try Spake2p.register(w1: w1)
     }
+    // (w0, w1 are secrets held in SymmetricKey; tests only compare behaviour.)
 }
 
 private func keyBytes(_ k: SymmetricKey) -> Data { k.withUnsafeBytes { Data($0) } }
@@ -62,9 +64,11 @@ private func exchange(
         let (p, shareP) = try Prover.start(context: ctx, idProver: idP, idVerifier: idV, w0: r.w0, w1: r.w1)
         let (_, shareV, confirmV) = try Verifier.respond(
             context: ctx, idProver: idP, idVerifier: idV, w0: r.w0, l: r.l, shareP: shareP)
-        // Flipping a bit of the y coordinate gives an off-curve point; of the x coordinate, almost
-        // always an off-curve point too: either way the exchange must fail.
-        #expect(throws: Spake2pError.self) { _ = try p.finish(shareV: flip(shareV, 40), confirmV: confirmV) }
+        // A flipped bit in the y coordinate (byte 40) gives an off-curve point, with probability
+        // 1 - 2^-255: the exact error is pinned.
+        #expect(throws: Spake2pError.notOnCurve) {
+            _ = try p.finish(shareV: ShareV(flip(shareV.bytes, 40)), confirmV: confirmV)
+        }
     }
 
     @Test func tamperedConfirmV() throws {
@@ -73,7 +77,7 @@ private func exchange(
         let (_, shareV, confirmV) = try Verifier.respond(
             context: ctx, idProver: idP, idVerifier: idV, w0: r.w0, l: r.l, shareP: shareP)
         #expect(throws: Spake2pError.confirmationFailed) {
-            _ = try p.finish(shareV: shareV, confirmV: flip(confirmV, 31))
+            _ = try p.finish(shareV: shareV, confirmV: ConfirmV(flip(confirmV.bytes, 31)))
         }
     }
 
@@ -82,7 +86,7 @@ private func exchange(
         let (_, shareP) = try Prover.start(context: ctx, idProver: idP, idVerifier: idV, w0: r.w0, w1: r.w1)
         #expect(throws: Spake2pError.notOnCurve) {
             _ = try Verifier.respond(
-                context: ctx, idProver: idP, idVerifier: idV, w0: r.w0, l: r.l, shareP: flip(shareP, 64))
+                context: ctx, idProver: idP, idVerifier: idV, w0: r.w0, l: r.l, shareP: ShareP(flip(shareP.bytes, 64)))
         }
     }
 
@@ -92,7 +96,7 @@ private func exchange(
         let (v, shareV, confirmV) = try Verifier.respond(
             context: ctx, idProver: idP, idVerifier: idV, w0: r.w0, l: r.l, shareP: shareP)
         let (confirmP, _) = try p.finish(shareV: shareV, confirmV: confirmV)
-        #expect(throws: Spake2pError.confirmationFailed) { _ = try v.finish(confirmP: flip(confirmP, 5)) }
+        #expect(throws: Spake2pError.confirmationFailed) { _ = try v.finish(confirmP: ConfirmP(flip(confirmP.bytes, 5))) }
     }
 
     @Test func contextAndIdentityBinding() throws {
@@ -121,34 +125,68 @@ private func exchange(
         let r = try Registered(seed: 7)
         let (_, shareP) = try Prover.start(context: ctx, idProver: idP, idVerifier: idV, w0: r.w0, w1: r.w1)
         func respond(_ share: Data) throws -> Verifier {
-            try Verifier.respond(context: ctx, idProver: idP, idVerifier: idV, w0: r.w0, l: r.l, shareP: share).0
+            try Verifier.respond(
+                context: ctx, idProver: idP, idVerifier: idV, w0: r.w0, l: r.l, shareP: ShareP(share)
+            ).0
         }
-        var compressed = shareP
+        var compressed = shareP.bytes
         compressed[0] = 0x02
         #expect(throws: Spake2pError.invalidEncoding) { _ = try respond(compressed) }
-        #expect(throws: Spake2pError.invalidLength) { _ = try respond(shareP.prefix(33)) }
-        #expect(throws: Spake2pError.invalidLength) { _ = try respond(shareP + Data([0])) }
-        #expect(throws: Spake2pError.notOnCurve) { _ = try respond(flip(shareP, 64)) }
+        // Wrong lengths are refused when the typed share is made.
+        #expect(throws: Spake2pError.invalidLength) { _ = try respond(shareP.bytes.prefix(33)) }
+        #expect(throws: Spake2pError.invalidLength) { _ = try respond(shareP.bytes + Data([0])) }
+        #expect(throws: Spake2pError.notOnCurve) { _ = try respond(flip(shareP.bytes, 64)) }
         #expect(throws: Spake2pError.invalidEncoding) { _ = try respond(Data(count: 65)) }
-        // An invalid stored L is its own error, whatever is wrong with it.
-        for badL in [flip(r.l, 64), Data(count: 65), r.l.prefix(64), r.l + Data([0])] {
-            #expect(throws: Spake2pError.invalidRecord) {
-                _ = try Verifier.respond(
-                    context: ctx, idProver: idP, idVerifier: idV, w0: r.w0, l: badL, shareP: shareP)
-            }
+    }
+
+    @Test func invalidStoredL() throws {
+        let r = try Registered(seed: 7)
+        // An invalid stored L is its own error, whatever is wrong with it, caught by L's init.
+        for badL in [flip(r.l.bytes, 64), Data(count: 65), r.l.bytes.prefix(64), r.l.bytes + Data([0]), Data()] {
+            #expect(throws: Spake2pError.invalidRecord) { _ = try L(badL) }
         }
+        var compressed = r.l.bytes
+        compressed[0] = 0x02
+        #expect(throws: Spake2pError.invalidRecord) { _ = try L(compressed) }
+        #expect(try L(r.l.bytes) == r.l)
+    }
+
+    @Test func typedValuesCheckLengths() {
+        for n in [0, 31, 33, 65] {
+            #expect(throws: Spake2pError.invalidLength, "W0 \(n)") { _ = try W0(Data(count: n)) }
+            #expect(throws: Spake2pError.invalidLength, "W1 \(n)") { _ = try W1(Data(count: n)) }
+        }
+        for n in [0, 31, 33, 64, 66] {
+            #expect(throws: Spake2pError.invalidLength) { _ = try ShareP(Data(count: n)) }
+            #expect(throws: Spake2pError.invalidLength) { _ = try ShareV(Data(count: n)) }
+        }
+        for n in [0, 31, 33, 65] {
+            #expect(throws: Spake2pError.invalidLength) { _ = try ConfirmP(Data(count: n)) }
+            #expect(throws: Spake2pError.invalidLength) { _ = try ConfirmV(Data(count: n)) }
+        }
+        #expect(throws: Never.self) { _ = try W0(Data(count: 32)) }
+        #expect(throws: Never.self) { _ = try ShareP(Data(count: 65)) }
+        #expect(throws: Never.self) { _ = try ConfirmV(Data(count: 32)) }
+    }
+
+    @Test func abiVersionMatchesHeader() {
+        #expect(Spake2p.abiVersion == 1)
+        #expect(Spake2p.abiVersion == UInt32(SPAKE2P_ABI_VERSION))
+        _ = Spake2p.abiChecked  // the precondition at first use did not trap
+    }
+
+    @Test func lengthConstantsComeFromTheHeader() {
+        #expect(Spake2p.pointLength == 65 && Spake2p.scalarLength == 32)
+        #expect(Spake2p.confirmLength == 32 && Spake2p.keyLength == 32 && Spake2p.pbkdfOutputLength == 80)
     }
 
     @Test func invalidShareVAtProver() throws {
         let r = try Registered(seed: 7)
         let (p, _) = try Prover.start(context: ctx, idProver: idP, idVerifier: idV, w0: r.w0, w1: r.w1)
-        #expect(throws: Spake2pError.invalidEncoding) {
-            _ = try p.finish(shareV: Data(count: 65), confirmV: Data(count: 32))
-        }
+        let zeroSV = try ShareV(Data(count: 65)), zeroCV = try ConfirmV(Data(count: 32))
+        #expect(throws: Spake2pError.invalidEncoding) { _ = try p.finish(shareV: zeroSV, confirmV: zeroCV) }
         // The failed finish consumed the Prover.
-        #expect(throws: Spake2pError.alreadyFinished) {
-            _ = try p.finish(shareV: Data(count: 65), confirmV: Data(count: 32))
-        }
+        #expect(throws: Spake2pError.alreadyFinished) { _ = try p.finish(shareV: zeroSV, confirmV: zeroCV) }
     }
 
     @Test func finishIsSingleUse() throws {
@@ -168,16 +206,28 @@ private func exchange(
         let (v, shareV, confirmV) = try Verifier.respond(
             context: ctx, idProver: idP, idVerifier: idV, w0: r.w0, l: r.l, shareP: shareP)
         let (confirmP, _) = try p.finish(shareV: shareV, confirmV: confirmV)
-        #expect(throws: Spake2pError.confirmationFailed) { _ = try v.finish(confirmP: flip(confirmP)) }
+        #expect(throws: Spake2pError.confirmationFailed) { _ = try v.finish(confirmP: ConfirmP(flip(confirmP.bytes))) }
         // A correct tag now cannot revive it.
         #expect(throws: Spake2pError.alreadyFinished) { _ = try v.finish(confirmP: confirmP) }
     }
 
-    @Test func unfinishedObjectsFreeCleanly() throws {
+    /// Releasing an unfinished Prover or Verifier runs its deinit (which frees the Rust handle).
+    /// That the C side then frees the block exactly once, wiped, is proved by the counting
+    /// allocator test in ffi/tests/handle_free.rs.
+    @Test func unfinishedObjectsAreReleased() throws {
         let r = try Registered(seed: 7)
-        for _ in 0..<100 {
-            _ = try Prover.start(context: ctx, idProver: idP, idVerifier: idV, w0: r.w0, w1: r.w1)
+        weak var weakProver: Prover?
+        weak var weakVerifier: Verifier?
+        do {
+            let (p, shareP) = try Prover.start(context: ctx, idProver: idP, idVerifier: idV, w0: r.w0, w1: r.w1)
+            let (v, _, _) = try Verifier.respond(
+                context: ctx, idProver: idP, idVerifier: idV, w0: r.w0, l: r.l, shareP: shareP)
+            weakProver = p
+            weakVerifier = v
+            #expect(weakProver != nil && weakVerifier != nil)
         }
+        #expect(weakProver == nil)
+        #expect(weakVerifier == nil)
     }
 
     @Test func pbkdfLengthErrors() {
@@ -186,10 +236,10 @@ private func exchange(
                 _ = try Spake2p.w0w1(fromPBKDFOutput: Data(repeating: 1, count: n))
             }
         }
-        #expect(throws: Spake2pError.invalidLength) { _ = try Spake2p.register(w1: Data(count: 31)) }
-        #expect(throws: Spake2pError.zeroScalar) { _ = try Spake2p.register(w1: Data(count: 32)) }
+        #expect(throws: Spake2pError.invalidLength) { _ = try Spake2p.register(w1: W1(Data(count: 31))) }
+        #expect(throws: Spake2pError.zeroScalar) { _ = try Spake2p.register(w1: W1(Data(count: 32))) }
         #expect(throws: Spake2pError.scalarOutOfRange) {
-            _ = try Spake2p.register(w1: Data(repeating: 0xff, count: 32))
+            _ = try Spake2p.register(w1: W1(Data(repeating: 0xff, count: 32)))
         }
         #expect(throws: Spake2pError.zeroScalar) {
             _ = try Spake2p.w0w1(fromPBKDFOutput: Data(count: 80))
@@ -197,7 +247,9 @@ private func exchange(
     }
 
     @Test func pbkdfInputLayout() throws {
-        let out = try Spake2p.pbkdfInput(password: Data("pw".utf8), idProver: Data("a".utf8), idVerifier: Data())
+        let out = try Spake2p.withPBKDFInput(
+            password: Data("pw".utf8), idProver: Data("a".utf8), idVerifier: Data()
+        ) { Data($0) }
         var want = Data()
         for s in ["pw", "a", ""] {
             var n = UInt64(s.utf8.count).littleEndian
@@ -225,10 +277,10 @@ private func exchange(
             }
             return d
         }
-        let l = try Spake2p.register(w1: hex("w1"))
-        #expect(l == (try hex("L")))
+        let l = try Spake2p.register(w1: W1(hex("w1")))
+        #expect(l.bytes == (try hex("L")))
         // The vector's identities run end to end too (random x and y, so only agreement is checked).
-        let w0 = try hex("w0"), w1 = try hex("w1")
+        let w0 = try W0(hex("w0")), w1 = try W1(hex("w1"))
         let c = Data((json["context"] as? String ?? "").utf8)
         let (p, shareP) = try Prover.start(
             context: c, idProver: Data("client".utf8), idVerifier: Data("server".utf8), w0: w0, w1: w1)

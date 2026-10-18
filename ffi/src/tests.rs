@@ -416,16 +416,23 @@ fn short_output_buffers() {
 }
 
 #[test]
-fn finish_consumes_handle_even_on_failure() {
-    // A handle whose finish failed must already be freed (Miri/ASan would flag a leak or double
-    // free; here we check the observable part: the API gives the caller no way to retry, and a
-    // second call with the stale pointer is documented as invalid). We verify both outcomes
-    // returned a status and the same inputs on a *fresh* handle succeed.
+fn finish_failure_does_not_poison_a_fresh_exchange() {
+    // The allocator test (tests/handle_free.rs) proves a failed finish frees the handle. Here: a
+    // finish that failed leaves no state behind, and the same inputs on a fresh handle succeed.
     let k = keys(7);
     let (p, share_p) = start(CTX, &k);
     let (_, v, sv, cv) = respond(CTX, &k, &share_p);
     assert_eq!(p_finish(p, &sv[..64], &cv).0, SPAKE2P_ERR_INVALID_LENGTH);
     unsafe { spake2p_verifier_free(v) };
+
+    let (p, share_p) = start(CTX, &k);
+    let (rc, v, sv, cv) = respond(CTX, &k, &share_p);
+    assert_eq!(rc, SPAKE2P_OK);
+    let (rc, cp, pkey) = p_finish(p, &sv, &cv);
+    assert_eq!(rc, SPAKE2P_OK);
+    let (rc, vkey) = v_finish(v, &cp);
+    assert_eq!(rc, SPAKE2P_OK);
+    assert_eq!(pkey, vkey);
 }
 
 #[test]
@@ -468,7 +475,8 @@ fn pbkdf_input_matches_core() {
 }
 
 #[test]
-fn panic_becomes_status() {
+fn guard_turns_a_panic_into_a_status() {
+    // `guard` wraps every exported body; no exported function can be made to panic from outside.
     assert_eq!(guard(|| panic!("boom")), SPAKE2P_ERR_PANIC);
 }
 
@@ -497,4 +505,159 @@ fn bad_stored_l_is_invalid_record_not_a_peer_error() {
     assert_eq!(SPAKE2P_ERR_UNKNOWN, 9);
     assert_eq!(SPAKE2P_ERR_NULL_POINTER, 100);
     unsafe { spake2p_prover_free(p) };
+}
+
+#[test]
+fn l_validate_accepts_a_good_l_and_rejects_every_defect() {
+    let k = keys(7);
+    let v = |b: &[u8]| unsafe { spake2p_l_validate(b.as_ptr(), b.len()) };
+    assert_eq!(v(&k.l), SPAKE2P_OK);
+    let mut bad = k.l;
+    bad[64] ^= 1;
+    assert_eq!(v(&bad), SPAKE2P_ERR_INVALID_RECORD);
+    bad = k.l;
+    bad[0] = 0x02;
+    assert_eq!(v(&bad), SPAKE2P_ERR_INVALID_RECORD);
+    assert_eq!(v(&[0u8; 65]), SPAKE2P_ERR_INVALID_RECORD);
+    assert_eq!(v(&k.l[..64]), SPAKE2P_ERR_INVALID_RECORD);
+    assert_eq!(v(&[]), SPAKE2P_ERR_INVALID_RECORD);
+    assert_eq!(
+        unsafe { spake2p_l_validate(ptr::null(), 0) },
+        SPAKE2P_ERR_INVALID_RECORD
+    );
+    assert_eq!(
+        unsafe { spake2p_l_validate(ptr::null(), 65) },
+        SPAKE2P_ERR_NULL_POINTER
+    );
+}
+
+#[test]
+fn abi_version_is_one() {
+    assert_eq!(spake2p_abi_version(), 1);
+    assert!(include_str!("../include/spake2p.h").contains("#define SPAKE2P_ABI_VERSION 1u"));
+}
+
+#[test]
+fn pbkdf_input_probe_accepts_null_out_with_zero_capacity() {
+    let mut n = 0usize;
+    let rc = unsafe {
+        spake2p_pbkdf_input(
+            b"pw".as_ptr(),
+            2,
+            ptr::null(),
+            0,
+            ptr::null(),
+            0,
+            ptr::null_mut(),
+            0,
+            &mut n,
+        )
+    };
+    assert_eq!(rc, SPAKE2P_ERR_BUFFER_TOO_SMALL);
+    assert_eq!(n, 24 + 2);
+    // NULL out with a non-zero capacity is still a NULL pointer error.
+    let rc = unsafe {
+        spake2p_pbkdf_input(
+            b"pw".as_ptr(),
+            2,
+            ptr::null(),
+            0,
+            ptr::null(),
+            0,
+            ptr::null_mut(),
+            64,
+            &mut n,
+        )
+    };
+    assert_eq!(rc, SPAKE2P_ERR_NULL_POINTER);
+}
+
+/// `NAME = value` pairs from a source text for names starting with `prefix`.
+fn constants(text: &str, prefix: &str) -> std::collections::BTreeMap<String, i64> {
+    let mut m = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let line = line.strip_prefix("pub const ").unwrap_or(line);
+        if !line.starts_with(prefix) {
+            continue;
+        }
+        let name_end = line
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap();
+        let name = &line[..name_end];
+        let rest = line[name_end..].trim_start_matches(|c: char| c != '=');
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let digits: String = rest
+            .trim()
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(v) = digits.parse() {
+            m.insert(name.to_string(), v);
+        }
+    }
+    m
+}
+
+#[test]
+fn status_constants_match_the_header() {
+    let header = constants(include_str!("../include/spake2p.h"), "SPAKE2P_ERR_");
+    let source = constants(include_str!("lib.rs"), "SPAKE2P_ERR_");
+    let table: [(&str, Spake2pStatus); 13] = [
+        ("SPAKE2P_ERR_INVALID_LENGTH", SPAKE2P_ERR_INVALID_LENGTH),
+        ("SPAKE2P_ERR_INVALID_ENCODING", SPAKE2P_ERR_INVALID_ENCODING),
+        ("SPAKE2P_ERR_NOT_ON_CURVE", SPAKE2P_ERR_NOT_ON_CURVE),
+        ("SPAKE2P_ERR_IDENTITY_POINT", SPAKE2P_ERR_IDENTITY_POINT),
+        (
+            "SPAKE2P_ERR_SCALAR_OUT_OF_RANGE",
+            SPAKE2P_ERR_SCALAR_OUT_OF_RANGE,
+        ),
+        ("SPAKE2P_ERR_ZERO_SCALAR", SPAKE2P_ERR_ZERO_SCALAR),
+        (
+            "SPAKE2P_ERR_CONFIRMATION_FAILED",
+            SPAKE2P_ERR_CONFIRMATION_FAILED,
+        ),
+        ("SPAKE2P_ERR_RNG", SPAKE2P_ERR_RNG),
+        ("SPAKE2P_ERR_UNKNOWN", SPAKE2P_ERR_UNKNOWN),
+        ("SPAKE2P_ERR_INVALID_RECORD", SPAKE2P_ERR_INVALID_RECORD),
+        ("SPAKE2P_ERR_NULL_POINTER", SPAKE2P_ERR_NULL_POINTER),
+        ("SPAKE2P_ERR_BUFFER_TOO_SMALL", SPAKE2P_ERR_BUFFER_TOO_SMALL),
+        ("SPAKE2P_ERR_PANIC", SPAKE2P_ERR_PANIC),
+    ];
+    // The table is the real values; the parsed lib.rs text must agree with it, and the header with both.
+    assert_eq!(
+        source.len(),
+        table.len(),
+        "lib.rs defines a status the table lacks: {source:?}"
+    );
+    assert_eq!(
+        header.len(),
+        table.len(),
+        "header and table differ: {header:?}"
+    );
+    for (name, value) in table {
+        assert_eq!(header.get(name), Some(&(value as i64)), "{name} in header");
+        assert_eq!(source.get(name), Some(&(value as i64)), "{name} in lib.rs");
+    }
+    assert_eq!(
+        constants(include_str!("../include/spake2p.h"), "SPAKE2P_OK").get("SPAKE2P_OK"),
+        Some(&0)
+    );
+    assert_eq!(SPAKE2P_OK, 0);
+}
+
+#[test]
+fn length_constants_match_the_header() {
+    let h = constants(include_str!("../include/spake2p.h"), "SPAKE2P_");
+    for (name, want) in [
+        ("SPAKE2P_SCALAR_LEN", SCALAR_LEN),
+        ("SPAKE2P_POINT_LEN", POINT_LEN),
+        ("SPAKE2P_CONFIRM_LEN", SCALAR_LEN),
+        ("SPAKE2P_KEY_LEN", SCALAR_LEN),
+        ("SPAKE2P_PBKDF_OUTPUT_LEN", PBKDF_OUTPUT_LEN),
+    ] {
+        assert_eq!(h.get(name), Some(&(want as i64)), "{name}");
+    }
 }

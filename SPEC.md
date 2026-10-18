@@ -99,8 +99,30 @@ shareV)`, `confirmV = HMAC(K_confirmV, shareP)`.
   `Finish`; they are idempotent and `Finish` calls them itself.
 - x and y are sampled by rejection: 32 bytes from the OS CSPRNG into a wiped buffer, retried while
   the value is >= n or zero (about 2^-32 per draw).
+- FFI handles: `spake2p_*_finish` and `spake2p_*_free` move the state out of the heap handle,
+  volatile-zero the whole handle block, and only then free it, so no secret is left in freed
+  memory (`ffi/tests/handle_free.rs` proves it with a counting allocator, for all four paths).
+- Swift: `W0` and `W1` are held in `SymmetricKey` storage and handed to C without an intermediate
+  copy; temporary `[UInt8]` buffers that held a secret are wiped with `memset_s`. The PBKDF input
+  (it contains the password) is only exposed through `withPBKDFInput { bytes in ... }` and wiped
+  when the closure returns. Copies the Swift runtime makes of caller-supplied `Data` are out of reach.
 - Confirmation tags are compared in constant time (Rust: `subtle` / `hmac::Mac::verify_slice`;
   Go: `crypto/hmac.Equal`).
+
+## C ABI and Swift surface
+
+- `ffi/include/spake2p.h` is the contract; a test parses it and asserts every status and length
+  constant equals the Rust value. `spake2p_abi_version()` returns the ABI version (1); the Swift
+  package checks it against the header's `SPAKE2P_ABI_VERSION` at first use and traps on a mismatch.
+- `spake2p_l_validate(l, len)` runs the core's `L::parse`: `SPAKE2P_OK`, or
+  `SPAKE2P_ERR_INVALID_RECORD` for any defect, length included. Swift `L(_:)` uses it.
+- Swift takes typed values, not `Data`: `W0`, `W1`, `L`, `ShareP`, `ShareV`, `ConfirmP`, `ConfirmV`,
+  each with a validating init (length; `L` fully). A wrong-length share therefore fails when the
+  value is made (`invalidLength`), a bad `L` as `invalidRecord`; point checks on shares still happen
+  in the core when the exchange uses them.
+- No output buffer is written on error, with one exception: `spake2p_pbkdf_input` writes `*out_len`
+  on `SPAKE2P_ERR_BUFFER_TOO_SMALL`. Its `out` may be NULL when `out_cap` is 0 (size probe).
+  Output buffers must not overlap an input or each other.
 
 ## Rate limiting
 

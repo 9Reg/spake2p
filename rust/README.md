@@ -45,7 +45,9 @@ assert_eq!(prover_key.as_bytes(), verifier_key.as_bytes());
   learns from a failure that its guess was right and never sends `confirmP`). Counting only
   `Verifier::finish` failures gives unlimited guesses. The same holds for `Prover::finish` against
   a peer that has not proved itself. Keep a small attempt budget per password, count at `respond`,
-  and use a memory-hard PBKDF. Use non-empty prover and verifier identities, as RFC 9383
+  and rotate the code when it is spent. A slow PBKDF matters only if the verifier record is
+  persisted and the password is low-entropy; for a short-lived record from a short code the attempt
+  budget is the defence. Use non-empty prover and verifier identities, as RFC 9383
   recommends. See "Rate limiting" in `SPEC.md`.
 - This crate has not had an independent audit. It reproduces the RFC 9383 test vector byte for
   byte.

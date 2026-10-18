@@ -24,21 +24,28 @@ public final class Prover {
     ///   - context: Application-chosen protocol context, bound into the transcript.
     ///   - idProver: The Prover's identity. RFC 9383 recommends non-empty.
     ///   - idVerifier: The Verifier's identity. RFC 9383 recommends non-empty.
-    ///   - w0: 32-byte scalar from ``Spake2p/w0w1(fromPBKDFOutput:)``.
-    ///   - w1: 32-byte scalar from ``Spake2p/w0w1(fromPBKDFOutput:)``.
+    ///   - w0: From ``Spake2p/w0w1(fromPBKDFOutput:)``.
+    ///   - w1: From ``Spake2p/w0w1(fromPBKDFOutput:)``.
     public static func start(
-        context: Data, idProver: Data, idVerifier: Data, w0: Data, w1: Data
-    ) throws(Spake2pError) -> (Prover, shareP: Data) {
+        context: Data, idProver: Data, idVerifier: Data, w0: W0, w1: W1
+    ) throws(Spake2pError) -> (Prover, shareP: ShareP) {
+        _ = Spake2p.abiChecked
         let ctx = [UInt8](context), idp = [UInt8](idProver), idv = [UInt8](idVerifier)
-        var w0 = [UInt8](w0), w1 = [UInt8](w1)
         var shareP = [UInt8](repeating: 0, count: Spake2p.pointLength)
-        defer { wipe(&w0); wipe(&w1) }
         var raw: OpaquePointer?
-        try check(spake2p_prover_start(
-            ctx, ctx.count, idp, idp.count, idv, idv.count, w0, w0.count, w1, w1.count,
-            &raw, &shareP, shareP.count))
+        // The scalars go to C straight from their wiped-on-release storage, never copied out.
+        let status = w0.withUnsafeBytes { b0 in
+            w1.withUnsafeBytes { b1 in
+                spake2p_prover_start(
+                    ctx, ctx.count, idp, idp.count, idv, idv.count,
+                    b0.bindMemory(to: UInt8.self).baseAddress, b0.count,
+                    b1.bindMemory(to: UInt8.self).baseAddress, b1.count,
+                    &raw, &shareP, shareP.count)
+            }
+        }
+        try check(status)
         guard let raw else { throw .unexpected(code: -1) }
-        return (Prover(handle: raw), Data(shareP))
+        return (Prover(handle: raw), try ShareP(Data(shareP)))
     }
 
     /// Checks the Verifier's `shareV` (65 bytes) and `confirmV` (32 bytes). Only if the confirmation
@@ -46,15 +53,15 @@ public final class Prover {
     ///
     /// Single-use: the Prover's state is destroyed by this call, success or failure. A second call
     /// throws ``Spake2pError/alreadyFinished``.
-    public func finish(shareV: Data, confirmV: Data) throws(Spake2pError) -> (confirmP: Data, sharedKey: SymmetricKey) {
+    public func finish(shareV: ShareV, confirmV: ConfirmV) throws(Spake2pError) -> (confirmP: ConfirmP, sharedKey: SymmetricKey) {
         guard let taken = handle else { throw .alreadyFinished }
         handle = nil  // the C call frees the handle on every path
-        let sv = [UInt8](shareV), cv = [UInt8](confirmV)
-        var confirmP = [UInt8](repeating: 0, count: Spake2p.scalarLength)
-        var key = [UInt8](repeating: 0, count: Spake2p.scalarLength)
+        let sv = [UInt8](shareV.bytes), cv = [UInt8](confirmV.bytes)
+        var confirmP = [UInt8](repeating: 0, count: Spake2p.confirmLength)
+        var key = [UInt8](repeating: 0, count: Spake2p.keyLength)
         defer { wipe(&key) }
         try check(spake2p_prover_finish(
             taken, sv, sv.count, cv, cv.count, &confirmP, confirmP.count, &key, key.count))
-        return (Data(confirmP), SymmetricKey(data: key))
+        return (try ConfirmP(Data(confirmP)), SymmetricKey(data: key))
     }
 }

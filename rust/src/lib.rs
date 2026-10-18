@@ -66,7 +66,10 @@
 //!   elsewhere, and the curve-point objects of the underlying library are wiped only where this
 //!   crate holds them (`Z`, `V` and the unmasked point), not inside `p256`'s temporaries.
 //! * A SPAKE2+ run lets an active attacker test exactly one password guess per run. Applications
-//!   must rate-limit attempts and choose a memory-hard PBKDF. See "Rate limiting" below.
+//!   must rate-limit attempts. A slow PBKDF matters only when the verifier record `(w0, L)` is
+//!   persisted and the password is low-entropy (a stolen record then allows an offline search);
+//!   for a short-lived record made from a short code, the attempt budget is the defence. See
+//!   "Rate limiting" below.
 //! * A stored `L` can be checked at load time with [`L::parse`] or [`L::validate`]; a bad one is
 //!   then [`Error::InvalidRecord`], a local fault, never a bad peer share.
 //! * Identities are bound into the transcript. RFC 9383 recommends non-empty `id_prover` and

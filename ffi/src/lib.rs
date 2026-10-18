@@ -6,14 +6,18 @@
 //!   On error no output buffer is written and no output handle is set (it is set to NULL).
 //! * Byte strings come as pointer plus length. A NULL pointer is accepted only with length 0.
 //! * Output buffers come as pointer plus capacity. They must be non-NULL and at least as large as
-//!   the documented output size; larger is fine, only the leading bytes are written.
+//!   the documented output size; larger is fine, only the leading bytes are written. The one
+//!   exception is the size probe of `spake2p_pbkdf_input` (NULL `out` with capacity 0).
+//! * Output buffers must not overlap an input or each other.
 //! * `*_finish` consumes its handle on success and on failure.
 //! * No panic crosses the boundary: every body runs under `catch_unwind` and a panic becomes
 //!   `SPAKE2P_ERR_PANIC`.
 
+use std::mem::{size_of, MaybeUninit};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::slice;
+use std::sync::atomic::{compiler_fence, Ordering};
 
 use spake2p::{
     ConfirmP, ConfirmV, Error, Prover, ShareP, ShareV, Verifier, L, PBKDF_OUTPUT_LEN, POINT_LEN,
@@ -57,6 +61,31 @@ pub const SPAKE2P_ERR_PANIC: Spake2pStatus = 102;
 pub struct Spake2pProver(Prover);
 /// Opaque Verifier handle (a boxed [`spake2p::Verifier`]).
 pub struct Spake2pVerifier(Verifier);
+
+/// Moves the state out of a heap handle, volatile-zeroes the whole block, then frees it.
+///
+/// `Box::from_raw(p).0` would copy the state to the stack and free the block with `w0`, `w1`,
+/// `x` and the key material still in it. Here the block is wiped before it goes back to the
+/// allocator; the moved state is zeroised by its own `Drop`.
+///
+/// # Safety
+/// `p` must be a live pointer from `Box::into_raw(Box::new(T))`, not used again afterwards.
+unsafe fn take_and_wipe<T>(p: *mut T) -> T {
+    // SAFETY: `p` is a live, properly aligned `T` (function contract); the read moves it out and
+    // the block is never read as a `T` again.
+    let state = unsafe { ptr::read(p) };
+    let block = p.cast::<u8>();
+    for i in 0..size_of::<T>() {
+        // SAFETY: `i < size_of::<T>()`, inside the block `p` points to; volatile so the optimiser
+        // may not drop the writes as dead stores before the free.
+        unsafe { ptr::write_volatile(block.add(i), 0) };
+    }
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: allocated by `Box::new(T)`; `MaybeUninit<T>` has `T`'s layout and no drop glue, so
+    // this frees the block without dropping the (already moved-out) contents.
+    drop(unsafe { Box::from_raw(p.cast::<MaybeUninit<T>>()) });
+    state
+}
 
 fn status_of(e: Error) -> Spake2pStatus {
     match e {
@@ -195,7 +224,8 @@ pub unsafe extern "C" fn spake2p_register(
 ///
 /// The required size is `24 + password_len + id_prover_len + id_verifier_len`; it is stored in
 /// `*out_len` on success and on `SPAKE2P_ERR_BUFFER_TOO_SMALL`, so a caller may probe with
-/// capacity 0 (and any non-NULL `out`). `out_len` must be non-NULL.
+/// capacity 0 (`out` may be NULL then). `out_len` must be non-NULL. Writing `*out_len` on
+/// `SPAKE2P_ERR_BUFFER_TOO_SMALL` is the one exception to "no output on error".
 ///
 /// # Safety
 /// All pointers must be valid for their stated lengths; `out_len` for one `size_t` write.
@@ -226,8 +256,9 @@ pub unsafe extern "C" fn spake2p_pbkdf_input(
         let buf = spake2p::pbkdf_input(pw, idp, idv);
         // SAFETY: `out_len` is non-NULL and valid for one write (caller contract).
         unsafe { *out_len = buf.len() };
-        if out.is_null() {
-            return Err(Fail(SPAKE2P_ERR_NULL_POINTER));
+        // The size probe: NULL `out` with capacity 0 is allowed (the output is never empty).
+        if out.is_null() && out_cap == 0 {
+            return Err(Fail(SPAKE2P_ERR_BUFFER_TOO_SMALL));
         }
         let o = Out::new(out, out_cap, buf.len())?;
         // SAFETY: `o` checked against `buf.len()`; `buf` is a local allocation.
@@ -314,11 +345,10 @@ pub unsafe extern "C" fn spake2p_prover_finish(
     if prover.is_null() {
         return SPAKE2P_ERR_NULL_POINTER;
     }
-    // SAFETY: non-NULL, and by contract a live Box-allocated handle; ownership is taken here so
-    // the state is zeroised on drop whatever happens next.
-    let boxed = unsafe { Box::from_raw(prover) };
+    // SAFETY: non-NULL, and by contract a live Box-allocated handle; ownership is taken here, the
+    // heap block is wiped and freed, and the moved state is zeroised on drop whatever happens next.
+    let state = unsafe { take_and_wipe(prover) }.0;
     guard(|| {
-        let state = boxed.0;
         // SAFETY: caller contract on each pointer/length pair.
         let (sv, cv) = unsafe {
             (
@@ -347,8 +377,8 @@ pub unsafe extern "C" fn spake2p_prover_finish(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spake2p_prover_free(prover: *mut Spake2pProver) {
     if !prover.is_null() {
-        // SAFETY: non-NULL live Box-allocated handle per contract; dropping zeroises it.
-        let _ = catch_unwind(AssertUnwindSafe(|| drop(unsafe { Box::from_raw(prover) })));
+        // SAFETY: non-NULL live Box-allocated handle per contract; wiped, freed, then dropped.
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(unsafe { take_and_wipe(prover) })));
     }
 }
 
@@ -435,10 +465,9 @@ pub unsafe extern "C" fn spake2p_verifier_finish(
     if verifier.is_null() {
         return SPAKE2P_ERR_NULL_POINTER;
     }
-    // SAFETY: non-NULL live Box-allocated handle per contract; ownership taken here.
-    let boxed = unsafe { Box::from_raw(verifier) };
+    // SAFETY: non-NULL live Box-allocated handle per contract; ownership taken here, block wiped.
+    let state = unsafe { take_and_wipe(verifier) }.0;
     guard(|| {
-        let state = boxed.0;
         // SAFETY: caller contract.
         let cp = unsafe { input(confirm_p, confirm_p_len)? };
         let o_key = Out::new(key_out, key_cap, SCALAR_LEN)?;
@@ -457,11 +486,37 @@ pub unsafe extern "C" fn spake2p_verifier_finish(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spake2p_verifier_free(verifier: *mut Spake2pVerifier) {
     if !verifier.is_null() {
-        // SAFETY: non-NULL live Box-allocated handle per contract; dropping zeroises it.
+        // SAFETY: non-NULL live Box-allocated handle per contract; wiped, freed, then dropped.
         let _ = catch_unwind(AssertUnwindSafe(|| {
-            drop(unsafe { Box::from_raw(verifier) })
+            drop(unsafe { take_and_wipe(verifier) })
         }));
     }
+}
+
+/// Checks a stored verification value `L` (65 bytes): `SPAKE2P_OK` if it parses as a valid
+/// uncompressed, on-curve, non-identity point, `SPAKE2P_ERR_INVALID_RECORD` for any defect
+/// (length included). For checking a record at load time.
+///
+/// # Safety
+/// `l` must be valid for `l_len` bytes (NULL only with 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spake2p_l_validate(l: *const u8, l_len: usize) -> Spake2pStatus {
+    guard(|| {
+        // SAFETY: caller contract.
+        let bytes = unsafe { input(l, l_len)? };
+        L::parse(bytes)?;
+        Ok(())
+    })
+}
+
+/// Version of this C ABI (bumped on any incompatible change). Currently 1.
+pub const SPAKE2P_ABI_VERSION: u32 = 1;
+
+/// The ABI version this library was built with; a client built against a header of a different
+/// version must refuse to run.
+#[unsafe(no_mangle)]
+pub extern "C" fn spake2p_abi_version() -> u32 {
+    SPAKE2P_ABI_VERSION
 }
 
 /// The PBKDF output length `spake2p_w0w1_from_pbkdf_output` requires (80).

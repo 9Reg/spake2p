@@ -85,14 +85,14 @@ func runProver(_ cfg: Config) throws -> Data {
         let (w0, w1) = try Spake2p.w0w1(fromPBKDFOutput: cfg.pbkdfOutput)
         let (prover, shareP) = try Prover.start(
             context: cfg.context, idProver: cfg.idProver, idVerifier: cfg.idVerifier, w0: w0, w1: w1)
-        send([("shareP", hex(shareP))])
+        send([("shareP", hex(shareP.bytes))])
         let msg = try recv()
         if msg["abort"] as? Bool == true { throw Failure(kind: "peer_aborted") }
         let shareV = try hexField(msg, "shareV"), confirmV = try hexField(msg, "confirmV")
         guard shareV.count == 65 else { throw Failure(kind: "invalid_point") }
         do {
-            let (confirmP, key) = try prover.finish(shareV: shareV, confirmV: confirmV)
-            send([("confirmP", hex(confirmP))])
+            let (confirmP, key) = try prover.finish(shareV: ShareV(shareV), confirmV: ConfirmV(confirmV))
+            send([("confirmP", hex(confirmP.bytes))])
             return key.withUnsafeBytes { Data($0) }
         } catch {
             send([("abort", true)])
@@ -106,7 +106,7 @@ func runProver(_ cfg: Config) throws -> Data {
 func runVerifier(_ cfg: Config) throws -> Data {
     do {
         // Derive w0 and L, then let w1 go: the Verifier never keeps it.
-        let (w0, l): (Data, Data) = try {
+        let (w0, l): (W0, L) = try {
             let (w0, w1) = try Spake2p.w0w1(fromPBKDFOutput: cfg.pbkdfOutput)
             return (w0, try Spake2p.register(w1: w1))
         }()
@@ -116,11 +116,11 @@ func runVerifier(_ cfg: Config) throws -> Data {
         guard shareP.count == 65 else { throw Failure(kind: "invalid_point") }
         let (verifier, shareV, confirmV) = try Verifier.respond(
             context: cfg.context, idProver: cfg.idProver, idVerifier: cfg.idVerifier,
-            w0: w0, l: l, shareP: shareP)
-        send([("shareV", hex(shareV)), ("confirmV", hex(confirmV))])
+            w0: w0, l: l, shareP: ShareP(shareP))
+        send([("shareV", hex(shareV.bytes)), ("confirmV", hex(confirmV.bytes))])
         let msg = try recv()
         if msg["abort"] as? Bool == true { throw Failure(kind: "peer_aborted") }
-        let key = try verifier.finish(confirmP: try hexField(msg, "confirmP"))
+        let key = try verifier.finish(confirmP: ConfirmP(hexField(msg, "confirmP")))
         return key.withUnsafeBytes { Data($0) }
     } catch let e as Spake2pError {
         throw Failure(kind: kind(e))

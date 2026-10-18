@@ -1,3 +1,4 @@
+import CSpake2p
 import Foundation
 
 /// Why a SPAKE2+ operation failed. Mirrors `spake2p::Error` in the Rust core. Carries no secret data.
@@ -29,25 +30,26 @@ public enum Spake2pError: Error, Equatable, Sendable {
     case unexpected(code: Int32)
 
     init(status: Int32) {
-        switch status {
-        case 1: self = .invalidLength
-        case 2: self = .invalidEncoding
-        case 3: self = .notOnCurve
-        case 4: self = .identityPoint
-        case 5: self = .scalarOutOfRange
-        case 6: self = .zeroScalar
-        case 7: self = .confirmationFailed
-        case 8: self = .rng
-        case 10: self = .invalidRecord
+        // The C constants (header enum) are imported as `Int`; match on them, never on literals.
+        switch Int(status) {
+        case SPAKE2P_ERR_INVALID_LENGTH: self = .invalidLength
+        case SPAKE2P_ERR_INVALID_ENCODING: self = .invalidEncoding
+        case SPAKE2P_ERR_NOT_ON_CURVE: self = .notOnCurve
+        case SPAKE2P_ERR_IDENTITY_POINT: self = .identityPoint
+        case SPAKE2P_ERR_SCALAR_OUT_OF_RANGE: self = .scalarOutOfRange
+        case SPAKE2P_ERR_ZERO_SCALAR: self = .zeroScalar
+        case SPAKE2P_ERR_CONFIRMATION_FAILED: self = .confirmationFailed
+        case SPAKE2P_ERR_RNG: self = .rng
+        case SPAKE2P_ERR_INVALID_RECORD: self = .invalidRecord
         default: self = .unexpected(code: status)
         }
     }
 }
 
-/// Throws the matching `Spake2pError` unless `status` is success (0).
+/// Throws the matching `Spake2pError` unless `status` is `SPAKE2P_OK`.
 @inline(__always)
 func check(_ status: Int32) throws(Spake2pError) {
-    if status != 0 { throw Spake2pError(status: status) }
+    if Int(status) != SPAKE2P_OK { throw Spake2pError(status: status) }
 }
 
 /// Overwrites `bytes` with zeros in a way the optimiser may not remove (best effort: copies made

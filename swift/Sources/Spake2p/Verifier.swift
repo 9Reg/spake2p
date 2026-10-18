@@ -25,35 +25,38 @@ public final class Verifier {
     ///   - context: Must equal the Prover's, or confirmation fails.
     ///   - idProver: Must equal the Prover's.
     ///   - idVerifier: Must equal the Prover's.
-    ///   - w0: 32-byte scalar.
-    ///   - l: The 65-byte registration point from ``Spake2p/register(w1:)``.
-    ///   - shareP: The Prover's 65-byte share.
+    ///   - w0: The stored scalar.
+    ///   - l: The registration point from ``Spake2p/register(w1:)``.
+    ///   - shareP: The Prover's share.
     public static func respond(
-        context: Data, idProver: Data, idVerifier: Data, w0: Data, l: Data, shareP: Data
-    ) throws(Spake2pError) -> (Verifier, shareV: Data, confirmV: Data) {
+        context: Data, idProver: Data, idVerifier: Data, w0: W0, l: L, shareP: ShareP
+    ) throws(Spake2pError) -> (Verifier, shareV: ShareV, confirmV: ConfirmV) {
+        _ = Spake2p.abiChecked
         let ctx = [UInt8](context), idp = [UInt8](idProver), idv = [UInt8](idVerifier)
-        var w0 = [UInt8](w0)
-        let l = [UInt8](l), sp = [UInt8](shareP)
+        let lb = [UInt8](l.bytes), sp = [UInt8](shareP.bytes)
         var shareV = [UInt8](repeating: 0, count: Spake2p.pointLength)
-        var confirmV = [UInt8](repeating: 0, count: Spake2p.scalarLength)
-        defer { wipe(&w0) }
+        var confirmV = [UInt8](repeating: 0, count: Spake2p.confirmLength)
         var raw: OpaquePointer?
-        try check(spake2p_verifier_respond(
-            ctx, ctx.count, idp, idp.count, idv, idv.count, w0, w0.count, l, l.count, sp, sp.count,
-            &raw, &shareV, shareV.count, &confirmV, confirmV.count))
+        let status = w0.withUnsafeBytes { b0 in
+            spake2p_verifier_respond(
+                ctx, ctx.count, idp, idp.count, idv, idv.count,
+                b0.bindMemory(to: UInt8.self).baseAddress, b0.count, lb, lb.count, sp, sp.count,
+                &raw, &shareV, shareV.count, &confirmV, confirmV.count)
+        }
+        try check(status)
         guard let raw else { throw .unexpected(code: -1) }
-        return (Verifier(handle: raw), Data(shareV), Data(confirmV))
+        return (Verifier(handle: raw), try ShareV(Data(shareV)), try ConfirmV(Data(confirmV)))
     }
 
     /// Checks the Prover's `confirmP` (32 bytes) and, only if it matches, returns the shared key.
     ///
     /// Single-use: the Verifier's state is destroyed by this call, success or failure. A second
     /// call throws ``Spake2pError/alreadyFinished``.
-    public func finish(confirmP: Data) throws(Spake2pError) -> SymmetricKey {
+    public func finish(confirmP: ConfirmP) throws(Spake2pError) -> SymmetricKey {
         guard let taken = handle else { throw .alreadyFinished }
         handle = nil  // the C call frees the handle on every path
-        let cp = [UInt8](confirmP)
-        var key = [UInt8](repeating: 0, count: Spake2p.scalarLength)
+        let cp = [UInt8](confirmP.bytes)
+        var key = [UInt8](repeating: 0, count: Spake2p.keyLength)
         defer { wipe(&key) }
         try check(spake2p_verifier_finish(taken, cp, cp.count, &key, key.count))
         return SymmetricKey(data: key)
