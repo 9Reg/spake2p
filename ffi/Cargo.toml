@@ -1,0 +1,28 @@
+[package]
+name = "spake2p-ffi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/9Reg/spake2p"
+description = "C ABI over the spake2p crate (RFC 9383 SPAKE2+), for the Swift package"
+publish = false
+
+[lib]
+# rlib lets the integration tests under tests/ link the crate; the xcframework uses the .a.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+spake2p = { path = "../rust" }
+
+# Panics must unwind so that catch_unwind can turn them into a status code at the boundary.
+# (Explicit, so a later `panic = "abort"` cannot sneak in from a workspace or a tool default.)
+# No `strip`: a staticlib's symbols are removed by the app's own linker/strip step.
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "unwind"
